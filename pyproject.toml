@@ -1,0 +1,19 @@
+[project]
+name = "mcp-sta"
+version = "0.1.0"
+description = "MCP server exposing OpenROAD static timing analysis (OpenSTA) tools"
+readme = "README.md"
+authors = [
+    { name = "anshwppr", email = "anshbajaj77@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "mcp[cli]>=2",
+]
+
+[project.scripts]
+mcp-sta = "mcp_sta:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
