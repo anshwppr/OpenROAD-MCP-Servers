@@ -1,7 +1,7 @@
 [project]
 name = "mcp-sta"
 version = "0.1.0"
-description = "MCP servers for OpenROAD: static timing analysis (mcp-sta), the OpenDB design database (mcp-odb), gate-level netlist analysis (mcp-netlist) and the physical-design stages (mcp-opt, mcp-place, ...)"
+description = "MCP servers for OpenROAD: static timing analysis (mcp-sta), the OpenDB design database (mcp-odb), gate-level netlist analysis (mcp-netlist) and the physical-design stages (mcp-place, mcp-opt, mcp-route, mcp-signoff)"
 readme = "README.md"
 authors = [
     { name = "anshwppr", email = "anshbajaj77@gmail.com" }
@@ -17,6 +17,8 @@ mcp-odb = "mcp_odb:main"
 mcp-netlist = "mcp_netlist:main"
 mcp-opt = "mcp_opt:main"
 mcp-place = "mcp_place:main"
+mcp-route = "mcp_route:main"
+mcp-signoff = "mcp_signoff:main"
 
 [dependency-groups]
 dev = [
@@ -28,7 +30,7 @@ requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-module-name = ["mcp_sta", "mcp_odb", "mcp_netlist", "mcp_opt", "mcp_place", "openroad_common"]
+module-name = ["mcp_sta", "mcp_odb", "mcp_netlist", "mcp_opt", "mcp_place", "mcp_route", "mcp_signoff", "openroad_common"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

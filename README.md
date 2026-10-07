@@ -1,4 +1,4 @@
-# OpenROAD MCP Servers — `mcp-sta`, `mcp-odb`, `mcp-netlist`, `mcp-place` and `mcp-opt`
+# OpenROAD MCP Servers — `mcp-sta`, `mcp-odb`, `mcp-netlist`, `mcp-place`, `mcp-opt`, `mcp-route` and `mcp-signoff`
 
 Independent [MCP](https://modelcontextprotocol.io) servers that give AI assistants (Claude Desktop,
 Claude Code, or any MCP client) access to OpenROAD:
@@ -10,6 +10,8 @@ Claude Code, or any MCP client) access to OpenROAD:
 | **`mcp-netlist`** | `openroad-netlist` | **Gate-level netlist analysis** on a unit-delay library: gate counts, fanin/fanout cones, logic depth, path existence and dominance, cuts, constants, floating signals, renaming and `write_verilog`. 23 tools, 1 prompt. See [Netlist analysis server](#netlist-analysis-server-mcp-netlist). |
 | **`mcp-opt`** | `openroad-opt` | **Design optimization**, the first of four physical-design stage servers: parasitic estimation, DRV repair, tie cells, clock tree synthesis, setup/hold repair, power recovery, legalization. Technology-independent (platforms), with checkpoints to hand designs to the other stages. 26 tools, 4 prompts. See [Optimization server](#optimization-server-mcp-opt). |
 | **`mcp-place`** | `openroad-place` | **Floorplan and placement**, the stage before `mcp-opt`: floorplan, I/O pins, macro placement, tap cells, power grid, global and detailed placement, fillers, or the whole stage in one call. Technology-independent (platforms), hands off through checkpoints. 30 tools, 3 prompts. See [Placement server](#placement-server-mcp-place). |
+| **`mcp-route`** | `openroad-route` | **Routing**, the stage after `mcp-opt`: routing layers and capacity adjustments, global routing with congestion reports, antenna check and repair, detailed routing, DRC reports, or the whole stage in one call. Technology-independent (platforms), hands off through checkpoints. 22 tools, 3 prompts. See [Routing server](#routing-server-mcp-route). |
+| **`mcp-signoff`** | `openroad-signoff` | **Signoff**, the last stage: parasitic extraction (OpenRCX), signoff timing and power, power-grid connectivity and IR drop, metal density fill, a PASS/WARN/FAIL checklist, the final ODB/DEF/Verilog/SDC/SPEF files and an HTML timing report. Technology-independent (platforms). 22 tools, 3 prompts. See [Signoff server](#signoff-server-mcp-signoff). |
 
 All run on Windows. Each drives its own long-running `openroad` process inside **WSL Ubuntu**.
 The design is loaded once, and after that every tool call is a quick query against the live design.
@@ -125,6 +127,20 @@ Add this to `%APPDATA%\Claude\claude_desktop_config.json`:
       "env": {
         "OPENROAD_PLATFORM": "nangate45"
       }
+    },
+    "openroad-route": {
+      "command": "uv",
+      "args": ["--directory", "C:\\Users\\anshb\\Downloads\\MCP Server\\mcp_sta", "run", "mcp-route"],
+      "env": {
+        "OPENROAD_PLATFORM": "nangate45"
+      }
+    },
+    "openroad-signoff": {
+      "command": "uv",
+      "args": ["--directory", "C:\\Users\\anshb\\Downloads\\MCP Server\\mcp_sta", "run", "mcp-signoff"],
+      "env": {
+        "OPENROAD_PLATFORM": "nangate45"
+      }
     }
   }
 }
@@ -141,6 +157,8 @@ claude mcp add openroad-odb -e ODB_WSL_DISTRO=Ubuntu -- uv --directory "C:\Users
 claude mcp add openroad-netlist -e NETLIST_WSL_DISTRO=Ubuntu -- uv --directory "C:\Users\anshb\Downloads\MCP Server\mcp_sta" run mcp-netlist
 claude mcp add openroad-opt -e OPENROAD_PLATFORM=nangate45 -- uv --directory "C:\Users\anshb\Downloads\MCP Server\mcp_sta" run mcp-opt
 claude mcp add openroad-place -e OPENROAD_PLATFORM=nangate45 -- uv --directory "C:\Users\anshb\Downloads\MCP Server\mcp_sta" run mcp-place
+claude mcp add openroad-route -e OPENROAD_PLATFORM=nangate45 -- uv --directory "C:\Users\anshb\Downloads\MCP Server\mcp_sta" run mcp-route
+claude mcp add openroad-signoff -e OPENROAD_PLATFORM=nangate45 -- uv --directory "C:\Users\anshb\Downloads\MCP Server\mcp_sta" run mcp-signoff
 ```
 
 ### Run directly
@@ -151,6 +169,8 @@ uv run mcp-odb
 uv run mcp-netlist
 uv run mcp-opt
 uv run mcp-place
+uv run mcp-route
+uv run mcp-signoff
 ```
 
 ---
@@ -450,8 +470,8 @@ The rest of the OpenROAD flow is split into four stage servers that run in this 
 mcp-place ─▶ checkpoint ─▶ mcp-opt ─▶ checkpoint ─▶ mcp-route ─▶ checkpoint ─▶ mcp-signoff
 ```
 
-**`mcp-place` and `mcp-opt` are available now.** `mcp-route` and `mcp-signoff` are being built next on the same
-foundations. All of them share these rules:
+**All four stage servers are available**, so a synthesized netlist can be taken all the way to signed-off output
+files through MCP. All of them share these rules:
 - **Technology comes from a platform.** No tool contains a cell, layer or PDK name; a test enforces this.
 - **Designs move between servers as checkpoints.**
 - **The same 13 shared tools appear on every stage server.**
@@ -572,7 +592,7 @@ Only `platform=` differs between the three runs. The nangate45 and sky130hd `pla
 
 The macro placer was checked on its own test case (four macros placed, then one moved by hand).
 
-### Walkthrough: netlist → placed → optimized
+### Walkthrough: netlist → placed → optimized → routed → signed off
 
 ```text
 mcp-place:  load_design platform="nangate45" verilog_files=["/home/ansh/OpenROAD/test/gcd_nangate45.v"]
@@ -581,7 +601,15 @@ mcp-place:  load_design platform="nangate45" verilog_files=["/home/ansh/OpenROAD
             save_checkpoint name="placed"
 mcp-opt:    load_checkpoint name_or_path="placed"
             repair_design -> repair_tie_fanout -> legalize -> clock_tree_synthesis -> repair_timing
-            save_checkpoint name="cts"          (for mcp-route, next)
+            save_checkpoint name="cts"
+mcp-route:  load_checkpoint name_or_path="cts"
+            route_design                        (global route -> antennas -> detailed route -> fillers)
+            drc_report / routing_report
+            save_checkpoint name="routed"
+mcp-signoff: load_checkpoint name_or_path="routed"
+            extract_parasitics -> signoff_timing -> power_analysis -> check_power_grid -> analyze_ir_drop
+            signoff_checklist                   (PASS / WARN / FAIL per item)
+            timing_report_html, write_outputs   (ODB, DEF, Verilog, SDC, SPEF)
 ```
 
 ### Optimization server (`mcp-opt`)
@@ -613,6 +641,83 @@ legalization, CTS and `repair_timing`. It reaches final setup WNS **−0.025 ns*
 with 0 DRV violations and 35 clock sinks under 5 buffers. A checkpoint saved and reloaded in a fresh session
 gives the same design.
 
+### Routing server (`mcp-route`)
+
+Routes a placed, clock-tree-synthesized design (the `cts` checkpoint from `mcp-opt`) to a DRC-clean,
+antenna-clean layout. Its `routed` checkpoint is what `mcp-signoff` starts from.
+- **Results:** every action returns `summary`, `before` / `after` and the `log` tail, like the other stage servers.
+- **Defaults:** routing layers, layer adjustments, macro extension, diode cell and filler cells come from the
+  platform. `configure_routing` changes them.
+- **Reports** (DRC) go to `$HOME/openroad_mcp/reports` in WSL, not `/tmp`, because WSL clears `/tmp` when the
+  distro goes idle.
+
+| Tool | What it does |
+|---|---|
+| `configure_routing` | Signal/clock routing layers, per-layer and per-region capacity adjustments, macro extension; `reset_to_platform` re-applies the platform's settings |
+| `global_route` | Pin access (once) → `global_route -verbose` → global-routing parasitics. Routed/clock nets, wirelength, vias, per-layer congestion table and overflow. On unremovable overflow it fails with the congestion table and what to try |
+| `report_wire_length` | Wirelength per layer (global or detailed), or per net |
+| `check_antennas` | Antenna violations (nets and pins) on the global or detailed routes |
+| `repair_antennas` | Jumpers and/or diodes (platform `diode_cell`, else the library's antenna cell), then re-route. When there is no diode it says so instead of failing |
+| `detailed_route` | Detailed routing with a DRC report: one row per iteration (violations, wirelength, vias), final violations by type × layer. Running it again continues from the existing wires (after antenna diodes); to start over, load the checkpoint again |
+| `drc_report` | Reads the last DRC report (or `recheck=true` runs a fresh DRC check, optionally in an area): counts by type, layer, type × layer, the nets involved most, and each violation's box in µm |
+| `routing_report` | One page: global/detailed routing done, guides, all nets routed, clocks propagated, antennas, wirelength per layer, DRC count |
+| `route_design` | The whole stage in one call, in `flow.tcl` order: pin access → global route → antenna repair → detailed route → (antenna repair + detailed route) while violations remain → antenna check → fillers |
+
+Prompts: `route_and_verify`, `fix_congestion`, `drc_triage`.
+
+**Verified results** (`route_design` on the `cts` checkpoints made by `mcp-place` → `mcp-opt`, compared with this
+OpenROAD binary's own run of `test/flow.tcl`):
+
+| Platform | Global route | Detailed route (reference) | DRC | Antennas |
+|---|---|---|---|---|
+| nangate45 | 7897 µm, 2487 vias, overflow 0 (identical) | 5393 µm, 2191 vias (5392 µm), clean after 4 iterations (15 → 5 → 1 → 0) | 0 | 0 (no diode in the library, reported) |
+| sky130hd | 20327 µm, 2234 vias, overflow 0 (20244 µm) | 14863 µm, 2023 vias (14817 µm) | 0 | 10 fixed by 9 jumpers + 1 diode after global routing; 11 fixed by 12 diodes after detailed routing, then re-routed; 0 left |
+
+Only `platform=` differs. The `.metrics` files in OpenROAD's repository come from a newer OpenROAD than the
+installed binary (for example 6521 µm / 2410 vias for nangate45), so the binary's own run of the reference flow
+is the comparison. The routed databases were also loaded into `mcp-odb` (routed wirelength) and `mcp-sta`
+(timing). A checkpoint saved after global routing keeps its route guides, so detailed routing can continue in a
+new session (checked on asap7).
+
+### Signoff server (`mcp-signoff`)
+
+Signs off a routed design (the `routed` checkpoint from `mcp-route`) and writes the final files.
+- **Defaults:** RCX rules, supply nets, supply voltage, fill rules and filler cells come from the platform. Without
+  a `supply_voltage` the Liberty voltage is used.
+- **Files** go to `$HOME/openroad_mcp/signoff/<design>_<platform>` and `$HOME/openroad_mcp/outputs/<design>_<platform>`
+  in WSL. Every result also gives the Windows path (`\\wsl.localhost\Ubuntu\...`) so you can open it from Windows.
+- **Extraction keeps the design intact.** OpenRCX re-encodes the routed wires while it extracts, and a design saved
+  after that shows hundreds of false DRC shorts (OpenROAD's own flow never writes the design after extraction).
+  `extract_parasitics` therefore saves the design first, extracts and writes the SPEF, then reloads the saved design
+  with the SPEF. Timing uses the extracted parasitics; DRC checks and output files see the untouched routing.
+
+| Tool | What it does |
+|---|---|
+| `extract_parasitics` | OpenRCX with the platform's rules (coupling threshold and resistor merging can be changed) → SPEF → read back. Nets, resistor segments, ground and coupling caps. A missing rules file is caught before OpenRCX reads it |
+| `signoff_timing` | Setup/hold WNS and TNS, the worst endpoints, slew/cap/fanout violators, clock skew, minimum period (fmax) and total power, with a note when parasitics are not extracted |
+| `power_analysis` | Internal / switching / leakage power per group (sequential, combinational, clock, …), optionally with an input activity or a VCD file |
+| `check_power_grid` | Connectivity of each supply net (stripes, vias, cell supply pins); `require_terminals` also requires top-level supply ports |
+| `analyze_ir_drop` | Static IR drop per supply net (PDNSim): worst and average drop, % of supply, the worst instances, voltage file, optional EM currents; voltage source file or source type can be given |
+| `density_fill` | Metal fill from a fill-rules JSON (platform `fill_rules` or an argument): fill shapes per layer |
+| `signoff_checklist` | PASS / WARN / FAIL for routed, DRC (fresh check), antennas, placement, floating nets, setup, hold, slew/cap/fanout, extracted parasitics, power-grid connectivity and IR drop, plus an overall verdict |
+| `write_outputs` | ODB, DEF, Verilog (fillers left out, optional supply pins for LVS), SDC and SPEF. GDS needs KLayout or Magic and is not produced |
+| `timing_report_html` | Interactive HTML report (layout, worst paths, timing, schematic and DRC panels) to open in a browser. The design data is inside the file, but the page loads its JavaScript libraries from public CDNs, so it needs internet access. OpenROAD 26Q2's exporter drops the three.js import, which leaves the page blank; the tool puts the import (and the schematic libraries) back |
+
+Prompts: `signoff_review`, `ir_drop_review`, `tapeout_readiness`.
+
+**Verified results** (the routed designs made by `mcp-place` → `mcp-opt` → `mcp-route`, compared with the final
+report of this OpenROAD binary's own run of `test/flow.tcl`):
+
+| Platform | Setup WNS / TNS (reference) | Hold WNS (reference) | Skew | Power | IR drop VDD / VSS | DRC on written ODB |
+|---|---|---|---|---|---|---|
+| nangate45 | −0.029 / −0.241 ns (−0.029 / −0.241) | 0.046 ns (0.046) | 0.003 ns (0.003) | 2.38 mW (2.38) | 0.57 % / 0.58 % | 0 |
+| sky130hd | −0.547 ns (−0.538) | 0.483 ns (0.483) | | 1.48 mW | 0.01 % / 0.01 % | 0 |
+
+The checklist passes every item except setup (the reference design misses timing by a few ps in OpenROAD's own run
+too) and one max-capacitance pin, so its verdict is FAIL, as it should be. The written ODB + SPEF + SDC load
+into `mcp-sta` with the same WNS. Density fill was checked on sky130hd with OpenROAD's fill rules (31,912 shapes on
+met2–met5); nangate45 ships no fill rules, which the tool reports.
+
 ---
 
 ## Configuration
@@ -635,8 +740,9 @@ Each server reads its own prefix first (`STA_` for `mcp-sta`, `ODB_` for `mcp-od
 | `STA_ALLOW_RAW_TCL` | `1` | Set to `0` to remove the `run_tcl` tool |
 
 **Stage server settings:**
-- The prefix for `mcp-opt` is `OPT_` and for `mcp-place` it is `PLACE_`. Both default to a 1800 s timeout, because
-  optimization and placement on large designs take longer.
+- The prefixes are `PLACE_` (`mcp-place`), `OPT_` (`mcp-opt`), `ROUTE_` (`mcp-route`) and `SIGNOFF_`
+  (`mcp-signoff`). Placement, optimization and signoff default to a 1800 s timeout and routing to 7200 s,
+  because they take longer on large designs.
 - Platforms and checkpoints use these shared variables:
 
 | Variable | Default | Meaning |
@@ -684,6 +790,19 @@ discovery/validation, every optimization tool, the snapshot and a checkpoint rou
 - the hand-off of the `placed` checkpoint to `mcp-opt`, through CTS and `repair_timing`;
 - every placement tool step by step, including pin constraints, auto-skipped I/Os, PDN replace and fillers;
 - macro placement on the macro placer's own test case.
+
+`test_route_unit.py` checks the routing parsers (global route, congestion, wire length, antennas, detailed-route
+iterations, DRC report) on real logs and the tool/prompt lists. `test_route_e2e.py` (marker `openroad`) covers:
+- the full chain place → opt → `route_design` on gcd for nangate45 and sky130hd, compared with the binary's
+  reference run, plus `mcp-odb` / `mcp-sta` checks of the routed database;
+- every routing tool step by step, including a partial detailed route whose violations `drc_report` groups;
+- asap7 global routing, and detailed routing from a checkpoint saved after global routing.
+
+`test_signoff_unit.py` checks the signoff parsers (extraction, endpoints, slew/cap/fanout violators, power,
+fmax, IR/EM reports, fill) on real output. `test_signoff_e2e.py` (marker `openroad`) builds routed gcd designs for
+nangate45 and sky130hd through the place, opt and route servers, then runs every signoff tool and compares with
+the reference run. It also checks that the written ODB is DRC clean in a new session and that `mcp-sta` gives the
+same WNS from the written files, plus the error paths (unrouted design, missing rules, no SPEF yet).
 To run only the offline tests: `uv run pytest -m "not openroad and not slow"`.
 
 ### Prompt acceptance tests for `mcp-netlist` (separate venv)
@@ -761,6 +880,11 @@ Run calls with list arguments from **Git Bash** instead.
 | `mcp-odb` shows status `FIRM` after setting `FIXED` | Expected: OpenDB stores DEF `FIXED` as `FIRM`. |
 | `mcp-odb` routed lengths are all 0 | The design has no detailed routing (routed lengths come from OpenROAD's `report_wire_length -detailed_route`). Use `wirelength_report`'s HPWL instead. |
 | `place_io_pins`: `PPL-0111 ... does not have available slots` | A pin constraint region is too small for its pins at that spacing. Widen the region, lower `min_distance`, or make the die larger. |
+| `global_route`: `GRT-0116` / congestion error | The design cannot be routed without overflow. Follow the `fix_congestion` prompt: smaller layer adjustments, more layers, or re-place at lower density. |
+| `detailed_route` leaves DRC violations | Use `drc_report` to see the types and locations. Running `detailed_route` again continues from the current wires; to start over, `load_checkpoint` the unrouted checkpoint again. |
+| `extract_parasitics`: `RCX-0487` / `RCX-0468` | The rules file could not be read. After a failed read OpenRCX stays broken for that session: `load_checkpoint` again, then extract with a valid rules file. |
+| A DEF/ODB written by your own `run_tcl` after extraction shows DRC shorts | OpenRCX re-encodes wires. Use `write_outputs`, or write the design before extracting. |
+| HTML timing report is blank | The browser has no internet access (the page loads Leaflet, Golden Layout and three.js from CDNs), or the file was written by `web_save_report` directly rather than by `timing_report_html` (the raw OpenROAD file stops at `THREE is not defined`). Regenerate it with `timing_report_html`. |
 | `uv sync` fails with "file is being used by another process" | A server (for example an open MCP Inspector) is running `mcp-sta.exe` or `mcp-odb.exe`. Stop it and retry. |
 
 ---
@@ -788,7 +912,7 @@ Run calls with list arguments from **Git Bash** instead.
 
 ```
 mcp_sta/
-├── pyproject.toml              # all servers; dependency mcp[cli]>=2; entry points mcp-sta, mcp-odb, mcp-netlist, mcp-opt, mcp-place
+├── pyproject.toml              # all servers; dependency mcp[cli]>=2; entry points mcp-sta, mcp-odb, mcp-netlist, mcp-opt, mcp-place, mcp-route, mcp-signoff
 ├── README.md
 ├── openroad_bundle/            # unit_delay.lib/.lef, orhelp.tcl, netlists/test02..40.v, openroad_tasks.xlsx
 ├── src/
@@ -804,7 +928,9 @@ mcp_sta/
 │   ├── mcp_odb/server.py       # OpenDB helper procs, tools and prompts
 │   ├── mcp_netlist/            # netlist analysis: server.py (tools), tcl_procs.py (driver procs), names.py
 │   ├── mcp_opt/server.py       # optimization stage server (est, rsz, cts, dpl)
-│   └── mcp_place/server.py     # placement stage server (ifp, ppl, mpl, tap, pdn, gpl, dpl)
+│   ├── mcp_place/server.py     # placement stage server (ifp, ppl, mpl, tap, pdn, gpl, dpl)
+│   ├── mcp_route/server.py     # routing stage server (pin access, grt, ant, drt)
+│   └── mcp_signoff/server.py   # signoff stage server (rcx, sta, psm, fin, outputs)
 └── tests/                      # pytest: helpers, parsing, session protocol (tclsh)
     ├── oracle/                 # independent pure-Python netlist model (reference answers)
     ├── tasks/                  # xlsx export, prompt -> check mapping, checks

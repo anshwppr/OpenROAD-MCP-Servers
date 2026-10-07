@@ -369,3 +369,312 @@ def parse_gpl(log: str) -> dict[str, Any]:
             "warnings": messages(log),
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Routing: global route (grt), antennas (ant/grt), detailed route (drt)
+# ---------------------------------------------------------------------------
+
+_CONGESTION_ROW = re.compile(r"^(\S+)\s+(\d+)\s+(\d+)\s+([\d.]+)%\s+(\d+)\s*/\s*(\d+)\s*/\s*(\d+)\s*$")
+
+
+def parse_congestion(log: str) -> dict[str, Any]:
+    """The last ``GRT-0096 Final congestion report`` table: per layer and the Total row."""
+    layers: list[dict[str, Any]] = []
+    total: dict[str, Any] | None = None
+    for line in log.splitlines():
+        if "GRT-0096]" in line:
+            layers, total = [], None
+            continue
+        m = _CONGESTION_ROW.match(line.strip())
+        if not m:
+            continue
+        name, resource, demand, usage, max_h, max_v, overflow = m.groups()
+        row = {"resource": int(resource), "demand": int(demand), "usage_pct": float(usage),
+               "max_h_overflow": int(max_h), "max_v_overflow": int(max_v), "overflow": int(overflow)}
+        if name == "Total":
+            total = row
+        else:
+            layers.append({"layer": name, **row})
+    return compact({"layers": [r for r in layers if r["resource"] or r["demand"]], "total": total})
+
+
+def parse_grt(log: str) -> dict[str, Any]:
+    congestion = parse_congestion(log)
+    total = congestion.get("total") or {}
+    return compact(
+        {
+            "routed_nets": grab(log, r"GRT-0014\] Routed nets: (\d+)", int),
+            "clock_nets": grab(log, r"GRT-0019\] Found (\d+) clock nets", int),
+            "wirelength_um": grab(log, r"GRT-0018\] Total wirelength: (\S+) um"),
+            "vias": grab(log, r"GRT-0111\] Final number of vias: (\d+)", int),
+            "min_layer": grab(log, r"GRT-0020\] Min routing layer: (\S+)", str),
+            "max_layer": grab(log, r"GRT-0021\] Max routing layer: (\S+)", str),
+            "overflow": total.get("overflow"),
+            "usage_pct": total.get("usage_pct"),
+            "congestion": congestion.get("layers"),
+            "runtime": grab(log, r"GRT-0303\] Global routing runtime = (\S+)", str),
+            "warnings": messages(log),
+            "errors": messages(log, level="ERROR"),
+        }
+    )
+
+
+_WL_ROW = re.compile(r"^(\S+)\s+([\d.]+)um\s+(\d+)%\s*$", re.MULTILINE)
+
+
+def parse_wire_length_table(log: str) -> dict[str, Any]:
+    """``report_wire_length -summary`` (GRT-0278 global / GRT-0279 detailed): per-layer microns and %."""
+    layers = [{"layer": n, "um": float(um), "pct": int(pct)} for n, um, pct in _WL_ROW.findall(log)]
+    return compact({"layers": layers, "total_um": round(sum(r["um"] for r in layers), 2) if layers else None})
+
+
+def parse_antennas(log: str) -> dict[str, Any]:
+    """``check_antennas`` (ANT-0001/0002) and ``repair_antennas`` (GRT-0006/0012/0015/0302/0009) messages."""
+    found = grab_all(log, r"GRT-0012\] Found (\d+) antenna violations", int)
+    return compact(
+        {
+            "net_violations": grab(log, r"ANT-0002\] Found (\d+) net violations", int),
+            "pin_violations": grab(log, r"ANT-0001\] Found (\d+) pin violations", int),
+            "repair_iterations": grab(log, r"GRT-0006\] Repairing antennas, iteration (\d+)", int),
+            "violations_found": found[0] if found else None,
+            "violations_left": found[-1] if found else None,
+            "diodes_inserted": grab_sum(log, r"GRT-0015\] Inserted (\d+) diodes"),
+            "jumpers_inserted": grab_sum(log, r"GRT-0302\] Inserted (\d+) jumpers"),
+            "nets_rerouted": grab_sum(log, r"GRT-0009\] rerouting (\d+) nets"),
+            "no_diode": "GRT-0246" in log or None,
+        }
+    )
+
+
+# "Start 0th optimization iteration." / "Start 60th stubborn tiles iteration." / ...
+_DRT_ITER = re.compile(r"DRT-0195\] Start (\d+)\w* ([a-z ]*?)\s*iteration")
+
+
+def _viol_table(block: str) -> dict[str, dict[str, int]]:
+    """``Viol/Layer`` table after a DRT-0199 line: {violation type: {layer: count}}."""
+    lines = block.splitlines()
+    for i, line in enumerate(lines):
+        if not line.startswith("Viol/Layer"):
+            continue
+        layers = line.split()[1:]
+        table: dict[str, dict[str, int]] = {}
+        for row in lines[i + 1:]:
+            m = re.match(r"^(\D+?)\s+((?:\d+\s*)+)$", row)
+            if not m:
+                break
+            counts = [int(v) for v in m.group(2).split()]
+            table[m.group(1).strip()] = {lay: c for lay, c in zip(layers, counts) if c}
+        return table
+    return {}
+
+
+def parse_drt(log: str) -> dict[str, Any]:
+    """``detailed_route -verbose 1``: one row per optimization iteration, plus the final totals."""
+    starts = [(m.start(), int(m.group(1)), m.group(2)) for m in _DRT_ITER.finditer(log)]
+    iterations = []
+    for idx, (pos, number, kind) in enumerate(starts):
+        block = log[pos: starts[idx + 1][0] if idx + 1 < len(starts) else len(log)]
+        iterations.append(compact({
+            "iteration": number,
+            "kind": kind if kind != "optimization" else None,
+            "violations": grab(block, r"DRT-0199\]\s+Number of violations = (\d+)", int),
+            "wirelength_um": grab(block, r"^Total wire length = (\S+) um", int),
+            "vias": grab(block, r"^Total number of vias = (\d+)", int),
+            "by_type": _viol_table(block) or None,
+        }))
+    final_block = log[starts[-1][0]:] if starts else log
+    layers = {n: int(v) for n, v in re.findall(r"^Total wire length on LAYER (\S+) = (\d+) um", final_block, re.M)}
+    last = iterations[-1] if iterations else {}
+    return compact(
+        {
+            "iterations": iterations,
+            "final_violations": last.get("violations"),
+            "violations_by_type": last.get("by_type"),
+            "wirelength_um": grab(log, r"^Total wire length = (\S+) um", int),
+            "vias": grab(log, r"^Total number of vias = (\d+)", int),
+            "wirelength_by_layer_um": {k: v for k, v in layers.items() if v},
+            "completed": "DRT-0198" in log or None,
+            "warnings": messages(log),
+        }
+    )
+
+
+_DRC_BBOX = re.compile(r"bbox = \(\s*([-\d.]+),\s*([-\d.]+)\) - \(\s*([-\d.]+),\s*([-\d.]+)\) on Layer (\S+)")
+
+
+def parse_drc_report(text: str, limit: int = 50) -> dict[str, Any]:
+    """A detailed-router DRC report (``-output_drc`` or ``drt::check_drc``)::
+
+        violation type: Short
+            srcs: net:a net:b
+            bbox = (x1, y1) - (x2, y2) on Layer L
+    """
+    items: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("violation type:"):
+            items.append({"type": line.split(":", 1)[1].strip()})
+        elif items and line.startswith("srcs:"):
+            items[-1]["sources"] = line.split(":", 1)[1].split()
+        elif items and (m := _DRC_BBOX.search(line)):
+            items[-1]["bbox_um"] = [float(v) for v in m.groups()[:4]]
+            items[-1]["layer"] = m.group(5)
+    by_type: dict[str, int] = {}
+    by_layer: dict[str, int] = {}
+    by_type_layer: dict[str, int] = {}
+    nets: dict[str, int] = {}
+    for item in items:
+        layer = item.get("layer", "?")
+        by_type[item["type"]] = by_type.get(item["type"], 0) + 1
+        by_layer[layer] = by_layer.get(layer, 0) + 1
+        key = f"{item['type']} @ {layer}"
+        by_type_layer[key] = by_type_layer.get(key, 0) + 1
+        for src in item.get("sources", []):
+            if src.startswith("net:"):
+                nets[src[4:]] = nets.get(src[4:], 0) + 1
+    top_nets = sorted(nets.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+    return {
+        "total": len(items),
+        "by_type": by_type,
+        "by_layer": by_layer,
+        "by_type_layer": by_type_layer,
+        "top_nets": [{"net": n, "violations": c} for n, c in top_nets],
+        "violations": items[:limit],
+        "truncated": len(items) > limit,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Signoff: extraction (rcx), timing/power reports (sta), power grid (psm), fill (fin)
+# ---------------------------------------------------------------------------
+
+
+def parse_rcx(log: str) -> dict[str, Any]:
+    m = re.findall(r"RCX-0045\] Extract (\d+) nets, (\d+) rsegs, (\d+) caps, (\d+) ccs", log)
+    nets, rsegs, caps, ccs = (int(v) for v in m[-1]) if m else (None,) * 4
+    return compact(
+        {
+            "nets": nets,
+            "resistor_segments": rsegs,
+            "ground_caps": caps,
+            "coupling_caps": ccs,
+            "rc_segments": grab(log, r"RCX-0040\] Final (\d+) rc segments", int),
+            "coupling_threshold_ff": grab(log, r"RCX-0440\] Coupling threshhold is (\S+) fF"),
+            "warnings": messages(log),
+        }
+    )
+
+
+_DRV_SECTIONS = {"max slew": "max_slew", "max capacitance": "max_cap", "max fanout": "max_fanout"}
+_DRV_ROW = re.compile(r"^(\S+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+) \((VIOLATED|MET)\)")
+
+
+def parse_drv_violators(log: str) -> dict[str, list[dict[str, Any]]]:
+    """``report_check_types -max_slew -max_capacitance -max_fanout -violators``: rows per check."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    section = None
+    for line in log.splitlines():
+        if line.strip() in _DRV_SECTIONS:
+            section = _DRV_SECTIONS[line.strip()]
+            continue
+        m = _DRV_ROW.match(line.strip())
+        if m and section:
+            pin, limit, value, slack, _ = m.groups()
+            out.setdefault(section, []).append(
+                {"pin": pin, "limit": float(limit), "value": float(value), "slack": float(slack)})
+    return out
+
+
+_END_ROW = re.compile(r"^(\S+(?: \([^)]*\))?)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+) \((VIOLATED|MET)\)")
+
+
+def parse_endpoint_report(log: str) -> dict[str, list[dict[str, Any]]]:
+    """``report_checks -format end``: endpoints under ``max_delay/setup`` and ``min_delay/hold`` groups."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    check = None
+    for line in log.splitlines():
+        m = re.match(r"^(max_delay/setup|min_delay/hold) group (\S+)", line)
+        if m:
+            check = "setup" if m.group(1).startswith("max") else "hold"
+            continue
+        m = _END_ROW.match(line.strip())
+        if m and check:
+            endpoint, required, arrival, slack, _ = m.groups()
+            out.setdefault(check, []).append({"endpoint": endpoint, "required": float(required),
+                                              "arrival": float(arrival), "slack": float(slack)})
+    return out
+
+
+_POWER_ROW = re.compile(r"^(Sequential|Combinational|Clock|Macro|Pad|Total)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)%",
+                        re.MULTILINE)
+
+
+def parse_power(log: str) -> dict[str, Any]:
+    """``report_power`` table: internal/switching/leakage/total watts per group."""
+    groups = {}
+    for name, internal, switching, leakage, total_w, pct in _POWER_ROW.findall(log):
+        groups[name.lower()] = {"internal_w": float(internal), "switching_w": float(switching),
+                                "leakage_w": float(leakage), "total_w": float(total_w), "pct": float(pct)}
+    total = groups.pop("total", None)
+    return compact({"total_w": total["total_w"] if total else None, "total": total,
+                    "groups": {k: v for k, v in groups.items() if v["total_w"]}})
+
+
+def parse_clock_min_period(log: str) -> dict[str, dict[str, float]]:
+    """``report_clock_min_period``: ``core_clock period_min = 0.49 fmax = 2033.83``."""
+    return {clk: {"period_min": float(p), "fmax_mhz": float(f)}
+            for clk, p, f in re.findall(r"^(\S+) period_min = (\S+) fmax = (\S+)", log, re.MULTILINE)}
+
+
+_IR_KEYS = {
+    "Net": ("net", str),
+    "Corner": ("corner", str),
+    "Total power": ("total_power_w", float),
+    "Supply voltage": ("supply_voltage_v", float),
+    "Worstcase voltage": ("worst_voltage_v", float),
+    "Average voltage": ("average_voltage_v", float),
+    "Average IR drop": ("average_ir_drop_v", float),
+    "Worstcase IR drop": ("worst_ir_drop_v", float),
+    "Percentage drop": ("drop_pct", float),
+    "Maximum current": ("em_max_current_a", float),
+    "Average current": ("em_average_current_a", float),
+    "Number of resistors": ("em_resistors", int),
+}
+
+
+def parse_ir_report(log: str) -> list[dict[str, Any]]:
+    """``analyze_power_grid``: one dict per ``IR report`` block (plus its ``EM analysis`` block)."""
+    reports: list[dict[str, Any]] = []
+    for line in log.splitlines():
+        if line.startswith("########## IR report"):
+            reports.append({})
+            continue
+        m = re.match(r"^([A-Za-z ]+?)\s*:\s*(\S+)", line)
+        if m and reports and m.group(1) in _IR_KEYS:
+            key, cast = _IR_KEYS[m.group(1)]
+            value = m.group(2)
+            try:
+                reports[-1][key] = cast(value)
+            except ValueError:
+                reports[-1][key] = value
+    return reports
+
+
+def parse_fill(log: str) -> dict[str, Any]:
+    """``density_fill``: FIN-0004 'Total fills' is cumulative, so per-layer counts are differences."""
+    layers: dict[str, int] = {}
+    current, last_total = None, 0
+    for line in log.splitlines():
+        m = re.search(r"FIN-0003\] Filling layer (\S+?)\.?$", line)
+        if m:
+            current = m.group(1)
+            continue
+        m = re.search(r"FIN-0004\] Total fills: (\d+)", line)
+        if m and current:
+            total = int(m.group(1))
+            layers[current] = total - last_total
+            last_total = total
+    return compact({"fills_by_layer": layers, "total_fills": last_total if layers else None,
+                    "skipped_layers": grab_all(log, r"FIN-0010\] Skipping layer (\S+?)\.?$", str),
+                    "errors": messages(log, level="ERROR")})
