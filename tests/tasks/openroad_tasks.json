@@ -1,0 +1,2410 @@
+{
+ "source": "openroad_tasks.xlsx",
+ "setup": {
+  "Tool / version": "Verified with OpenROAD from the OpenROAD-flow-scripts Docker image openroad/orfs:v3.0-941-g3395328e (sha256:59c7d95ded17bf86a8882460eebc1e4a1e15e6b5ae763a362a7e2cafce209fe1; the binary reports 'HEAD-HASH-NOTFOUND' as its version). Only OpenROAD/OpenSTA commands are used; no yosys.",
+  "Files": "netlists/<case>.v : the contest netlists rewritten 1:1 onto unit_delay.lib cells (same instance names, net names and ports; and/or/nand/nor/xor/xnor/not/buf -> AND2/OR2/NAND2/NOR2/XOR2/XNOR2/INV/BUF with pins Y,A,B; dff -> DFF with CLK,RN,SN,D,Q).\nunit_delay.lib : every gate has delay exactly 1, so a path's arrival time = number of gates on it (DFF CLK->Q also = 1).\nunit_delay.lef : dummy abstracts; OpenROAD refuses to link without a LEF ('no technology has been read').\norhelp.tcl : small helper procs used below (putl prints one item per line: long single-line output can come out garbled in OpenROAD) (full text at the bottom of this sheet).",
+  "[LOAD] (start of every test)": "read_lef unit_delay.lef\nread_liberty unit_delay.lib\nread_verilog netlists/<case>.v\nlink_design top\nsource orhelp.tcl",
+  "[WRITE]": "write_verilog <case>_out.v",
+  "Conventions": "Put net/port names in braces so Tcl doesn't treat [ ] as commands: {n42[0]}.\nnode <name> = the port if <name> is a primary I/O, else the pin driving that net.\nget_fanin / get_fanout stop at flip-flops and INCLUDE the boundary DFF; `inst_names ... comb` drops DFFs (combinational cone, DFF Q = primary input).\nreport_checks -unconstrained: 'Actual Delay' / 'data arrival time' = gate depth. 'No paths found.' = no path. Paths starting at a DFF include its CLK->Q stage: subtract 1 (gdepth does this automatically).\nConstants: OpenROAD turns 1'b1 / 1'b0 into nets named one_ / zero_.",
+  "orhelp.tcl (also shipped as a file)": "# Helper procs (source this after link_design). Pure OpenROAD/OpenSTA Tcl.\n# node <name>     : the timing object for a signal: its port if it is a primary I/O, else the pin driving that net\nproc node {n} {\n  set p [get_ports -quiet $n]\n  if {[llength $p]} { return $p }\n  return [get_pins -of_objects [get_nets $n] -filter \"direction==output\"]\n}\n# inst_names <cells> [comb]: sorted instance names, dropping the top-level instance; with \"comb\", also drop DFFs\nproc inst_names {cells {mode all}} {\n  set r {}\n  foreach c $cells {\n    set n [get_full_name $c]\n    if {$n eq \"\"} continue\n    if {$mode eq \"comb\" && [get_property $c ref_name] eq \"DFF\"} continue\n    lappend r $n\n  }\n  return [lsort $r]\n}\n# gdepth <report-args>: max number of gates on paths matching the args (e.g. -to [node X], -through [get_pins g/Y]).\n#   PI-start paths use arrival directly; register-start paths subtract the CLK->Q stage (1). -1 = no path.\nproc gdepth {args} {\n  set best -1\n  foreach {from adj} [list [all_inputs] 0 [all_registers -clock_pins] 1] {\n    if {[llength $from] == 0} continue\n    if {[catch {set ps [find_timing_paths -unconstrained -from $from {*}$args -group_count 1]}]} continue\n    foreach p $ps {\n      set a [expr {int(round([get_property [lindex [get_property $p points] end] arrival])) - $adj}]\n      if {$a > $best} { set best $a }\n    }\n  }\n  return $best\n}\n# fanout_ports <obj>: names of primary outputs structurally reachable from obj (honours set_disable_timing)\nproc fanout_ports {obj} {\n  set r {}\n  foreach e [get_fanout -from $obj -flat -endpoints_only -trace_arcs enabled] {\n    set n [get_full_name $e]\n    if {[llength [get_ports -quiet $n]]} { lappend r $n }\n  }\n  return $r\n}\n# cut_pairs <wire>: \"pi->po\" pairs that are connected but lose every path when <wire> is blocked\nproc cut_pairs {w} {\n  set drv [get_cells -of_objects [node $w]]\n  set pairs {}\n  foreach p [get_fanin -to [node $w] -flat -startpoints_only] {\n    set pn [get_full_name $p]\n    if {![llength [get_ports -quiet $pn]]} continue\n    set before [fanout_ports $p]\n    set_disable_timing $drv\n    set after [fanout_ports $p]\n    unset_disable_timing $drv\n    foreach q $before { if {$q ne $w && $q ni $after} { lappend pairs \"$pn->$q\" } }\n  }\n  return $pairs\n}\n# artic_points <src> <dst>: gates whose removal disconnects src from dst (empty list + message if no path)\nproc artic_points {src dst} {\n  set d [get_full_name [node $dst]]\n  if {[lsearch -exact [fanout_ports [node $src]] $dst] < 0 && [llength [get_ports -quiet $dst]]} { puts \"no combinational path\"; return {} }\n  set A [inst_names [get_fanout -from [node $src] -flat -only_cells] comb]\n  set B [inst_names [get_fanin -to [node $dst] -flat -only_cells] comb]\n  set res {}\n  foreach g $A {\n    if {$g ni $B} continue\n    set_disable_timing [get_cells $g]\n    if {[lsearch -exact [fanout_ports [node $src]] $dst] < 0} { lappend res $g }\n    unset_disable_timing [get_cells $g]\n  }\n  return $res\n}\n# const_loads <0|1> [cell-type-glob]: cells with an input pin tied to constant 0/1\n#   (OpenROAD represents 1'b1 / 1'b0 as nets named one_ / zero_)\nproc const_loads {val {type *}} {\n  set net [expr {$val ? \"one_\" : \"zero_\"}]\n  set r {}\n  foreach p [get_pins -quiet -of_objects [get_nets -quiet $net] -filter \"direction==input\"] {\n    set c [get_cells -of_objects $p]\n    if {[string match $type [get_property $c ref_name]]} { lappend r [get_full_name $c] }\n  }\n  return [lsort -unique $r]\n}\n# putl <list>: print one item per line (very long single-line puts output can come out garbled in OpenROAD)\nproc putl {l} { foreach x $l { puts $x } }\n"
+ },
+ "summary": [
+  {
+   "type": "Analytical",
+   "category": "Constant Input Detection",
+   "count": 6,
+   "commands": "[LOAD]\nputl [const_loads 1 NAND2]                            ;# cells of a type with an input tied to 1'b1\nputl [const_loads 0 AND2]                             ;# ... tied to 1'b0\nputl [lsort -unique [concat [const_loads 1 NOR2] [const_loads 0 NOR2]]]   ;# any constant\nputl [const_loads 1]                                  ;# every cell (incl. DFF SN pins) tied to 1",
+   "confidence": 90,
+   "verified": "Prompts test32/36/37/39 (real designs: constants only on DFF pins; test37 = 2,324 DFFs) and 25 synthetic cases with gates tied to constants: exact.",
+   "notes": "Relies on OpenROAD naming the constant nets one_ / zero_."
+  },
+  {
+   "type": "Analytical",
+   "category": "Critical Path Membership",
+   "count": 1,
+   "commands": "[LOAD]\nset ends [concat [all_outputs] [all_registers -data_pins]]\nset L [gdepth -to $ends]\nset G [gdepth -through [get_pins <GATE>/Y] -to $ends]\nputs [expr {$G == $L ? \"yes\" : \"no\"}]",
+   "confidence": 92,
+   "verified": "30 gates on 7 testcases (incl. 11 that are on a max path), e.g. test32 g0 (prompt) = no.",
+   "notes": ""
+  },
+  {
+   "type": "Analytical",
+   "category": "Cut Analysis",
+   "count": 3,
+   "commands": "[LOAD]\nputl [cut_pairs {<WIRE>}]           ;# pi->po pairs that lose every path when <WIRE> is blocked; empty = not a cut\nputl [artic_points {<SRC>} {<DST>}] ;# gates whose removal disconnects SRC from DST",
+   "confidence": 85,
+   "verified": "cut_pairs on 16 wires (0-165 pairs) + prompts test33 n55104 / test36 n10239 (no). artic_points on 9 pairs + prompt test38 n2->n14 (no combinational path). All exact.",
+   "notes": "The wire itself is not counted as an endpoint. Uses set_disable_timing / unset_disable_timing in a loop."
+  },
+  {
+   "type": "Analytical",
+   "category": "Fanin Cone",
+   "count": 8,
+   "commands": "[LOAD]\nputl [inst_names [get_fanin -to [node {<OUT>}] -flat -only_cells] comb]   ;# combinational cone (DFF = boundary, excluded)\nputs \"--- incl. boundary DFFs:\"\nputl [inst_names [get_fanin -to [node {<OUT>}] -flat -only_cells]]        ;# same plus the boundary DFFs\n# largest cone:  foreach p [all_outputs] { puts \"[get_full_name $p] [llength [inst_names [get_fanin -to $p -flat -only_cells] comb]]\" }",
+   "confidence": 95,
+   "verified": "13 cones exact in both variants (all 8 prompt cones incl. test38 n14 / test32 n12 / test37 n8, which are DFF-driven; test18 n12 = 3,752; test40 internal net = 1,724).",
+   "notes": "get_fanin also returns the top-level instance (empty name) when it reaches a primary input; inst_names drops it."
+  },
+  {
+   "type": "Analytical",
+   "category": "Fanin Cone Intersection",
+   "count": 1,
+   "commands": "[LOAD]\nset A [inst_names [get_fanin -to [node {<A>}] -flat -only_cells] comb]\nset B [inst_names [get_fanin -to [node {<B>}] -flat -only_cells] comb]\nputl [lmap x $A {expr {$x in $B ? $x : [continue]}}]",
+   "confidence": 90,
+   "verified": "test31 n16/n17 (prompt, empty), test22 n5[10]/n5[14] (21), test35 n42[17]/n42[10] (90): exact.",
+   "notes": ""
+  },
+  {
+   "type": "Analytical",
+   "category": "Fanin Cone Size",
+   "count": 1,
+   "commands": "[LOAD]\nputs [llength [inst_names [get_fanin -to [node {<OUT>}] -flat -only_cells] comb]]",
+   "confidence": 95,
+   "verified": "test03 n15 (prompt) = 525 and all Fanin Cone checks.",
+   "notes": ""
+  },
+  {
+   "type": "Analytical",
+   "category": "Fanout Analysis",
+   "count": 28,
+   "commands": "[LOAD]\n# gates driven by a gate (use /Q for a DFF):\nputl [inst_names [get_cells -of_objects [get_pins -of_objects [get_nets -of_objects [get_pins <GATE>/Y]] -filter \"direction==input\"]]]\n# gates driven directly by a net or primary input:\nputl [inst_names [get_cells -of_objects [get_pins -of_objects [get_nets {<NET>}] -filter \"direction==input\"]]]\n# highest-fanout nets (load pins), constants excluded; add  && [llength [get_ports -quiet [get_full_name $n]]]  to rank inputs only\nset rows {}\nforeach n [get_nets *] { if {[get_full_name $n] in {one_ zero_}} continue\n  lappend rows [list [get_full_name $n] [llength [get_pins -quiet -of_objects $n -filter \"direction==input\"]]] }\nputl [lrange [lsort -integer -decreasing -index 1 $rows] 0 4]",
+   "confidence": 93,
+   "verified": "Successors of 15 gates (incl. g0 in test12/14/31/05/36) and loads of 10 primary-input bits: exact. Ranking on test36/21/05: exact counts, incl. a tie (n0 = n1 = 690 in test36).",
+   "notes": "get_nets -of_objects does not accept ports; use the net name, which equals the port name. Report ties."
+  },
+  {
+   "type": "Analytical",
+   "category": "Fanout Cone",
+   "count": 7,
+   "commands": "[LOAD]\nputl [inst_names [get_fanout -from [node {<IN>}] -flat -only_cells] comb]",
+   "confidence": 95,
+   "verified": "All 7 prompt cones exact (test15-20, test31, test32: n0 = clock only, empty).",
+   "notes": "Stops at DFFs (they're included without `comb`)."
+  },
+  {
+   "type": "Analytical",
+   "category": "Floating Signal Detection",
+   "count": 1,
+   "commands": "[LOAD]\nset fi {}; foreach p [all_inputs]  { set n [get_full_name $p]; if {[llength [get_pins -quiet -of_objects [get_nets $n] -filter \"direction==input\"]] == 0} { lappend fi $n } }\nset fo {}; foreach p [all_outputs] { set n [get_full_name $p]; if {[llength [get_pins -quiet -of_objects [get_nets $n] -filter \"direction==output\"]] == 0} { lappend fo $n } }\nputs \"unused inputs:\"; putl $fi\nputs \"undriven outputs:\"; putl $fo",
+   "confidence": 88,
+   "verified": "6 testcases exact (e.g. test31: 16 unused input bits, 2 undriven outputs).",
+   "notes": ""
+  },
+  {
+   "type": "Analytical",
+   "category": "Gate Count",
+   "count": 39,
+   "commands": "[LOAD]\nset n [dict create]\nforeach c [get_cells *] { dict incr n [get_property $c ref_name] }\nputs $n                                    ;# e.g. DFF 55 NAND2 227 NOR2 57 INV 43 ...\nreport_cell_usage                          ;# totals\nputs [llength [get_cells -filter \"ref_name==INV\" *]]   ;# one type (NOT = INV, BUF, AND2, OR2, NAND2, NOR2, XOR2, XNOR2, DFF)",
+   "confidence": 97,
+   "verified": "All 40 testcases: per-type counts and totals exact.",
+   "notes": ""
+  },
+  {
+   "type": "Analytical",
+   "category": "Gate Count (Cone)",
+   "count": 2,
+   "commands": "[LOAD]\nset n [dict create]\nforeach c [get_fanin -to [node {<OUT>}] -flat -only_cells] {\n  if {[get_full_name $c] eq \"\"} continue\n  set r [get_property $c ref_name]\n  if {$r ne \"DFF\"} { dict incr n $r }\n}\nputs $n",
+   "confidence": 93,
+   "verified": "test22 n5[3], test31 n2630, test17 n42[0]: per-type counts exact.",
+   "notes": "Combinational cone (DFFs excluded). An output driven straight from a DFF gives an empty dict."
+  },
+  {
+   "type": "Analytical",
+   "category": "Gate Inspection",
+   "count": 3,
+   "commands": "[LOAD]\nreport_instance -connections <GATE>       ;# cell type + input/output pins and nets",
+   "confidence": 88,
+   "verified": "test31 g0 (INV, A=n4490, Y=n4404) and g1027 (DFF CLK=n0 RN=n1 SN=one_ D=n1747 Q=n16) match the source.",
+   "notes": "This build prints a deprecation warning for -connections but still prints the pins."
+  },
+  {
+   "type": "Analytical",
+   "category": "Gate Listing",
+   "count": 3,
+   "commands": "[LOAD]\nputl [inst_names [get_cells -filter \"ref_name==NAND2\" *]]\n# pins of each: foreach g [inst_names [get_cells -filter \"ref_name==NAND2\" *]] { report_instance -connections $g }",
+   "confidence": 93,
+   "verified": "test35 NAND2 (19,682), test39 XOR2 (86), test32 NAND2 (9,347): exact sets.",
+   "notes": ""
+  },
+  {
+   "type": "Analytical",
+   "category": "I/O Summary",
+   "count": 6,
+   "commands": "[LOAD]\nputs \"[llength [all_inputs]] [llength [all_outputs]]\"   ;# number of input / output bits\nset w [dict create]\nforeach p [all_inputs]  { regsub {\\[\\d+\\]$} [get_full_name $p] \"\" b; dict incr w $b }\nputs $w                                                  ;# input ports with bit widths\nset w [dict create]\nforeach p [all_outputs] { regsub {\\[\\d+\\]$} [get_full_name $p] \"\" b; dict incr w $b }\nputs $w                                                  ;# output ports with bit widths",
+   "confidence": 92,
+   "verified": "test37/32/13: input and output bit names exact. Widths: see regression.",
+   "notes": "Counts are bits; the width dicts give ports."
+  },
+  {
+   "type": "Analytical",
+   "category": "Logic Cone Size",
+   "count": 1,
+   "commands": "[LOAD]\nputs [llength [inst_names [get_fanin -to [node {<OUT>}] -flat -only_cells] comb]]",
+   "confidence": 95,
+   "verified": "test32 n12 (prompt) = 0 (DFF-driven) and all Fanin Cone checks.",
+   "notes": ""
+  },
+  {
+   "type": "Analytical",
+   "category": "Logic Depth",
+   "count": 38,
+   "commands": "[LOAD]\nreport_checks -unconstrained -from [node {<IN>}] -to [node {<OUT>}]   ;# data arrival time = depth; 'No paths found.' = no path\nputs [gdepth -to [node {<OUT>}]]                                       ;# depth of <OUT>'s cone (from any PI or DFF)\nreport_checks -unconstrained -from [all_inputs] -to [all_outputs]     ;# max PI->PO depth\nputs [gdepth -to [concat [all_outputs] [all_registers -data_pins]]]   ;# whole-design max depth\nforeach p [all_outputs] { puts \"[get_full_name $p] [gdepth -to $p]\" } ;# per output (-1 = no path)",
+   "confidence": 95,
+   "verified": "All 26 IN->OUT prompts + 1 more (13 'no path'), e.g. test14 n0[0]->n63[1] = 54. PI->PO on 10 testcases. Per-output depth on all 285 outputs of test13/22/31: exact.",
+   "notes": "Depth counts gates (BUF/INV count). If the path starts at a DFF, report_checks includes CLK->Q: subtract 1 (gdepth does). The full report also lists every gate on the path."
+  },
+  {
+   "type": "Analytical",
+   "category": "Logic Depth (Sequential)",
+   "count": 3,
+   "commands": "[LOAD]\nreport_checks -unconstrained -from [all_inputs] -to [all_registers -data_pins]                     ;# PI -> DFF D: arrival = depth\nreport_checks -unconstrained -from [all_registers -clock_pins] -to [all_registers -data_pins]      ;# reg -> reg: arrival - 1 = depth",
+   "confidence": 93,
+   "verified": "10 testcases exact (e.g. test40 reg->reg = 105-1 = 104, test31 PI->D = 14).",
+   "notes": "Errors with 'no valid objects' when the design has no DFFs."
+  },
+  {
+   "type": "Analytical",
+   "category": "Path Dominance",
+   "count": 1,
+   "commands": "[LOAD]\nreport_checks -unconstrained -from [node {<IN>}] -to [node {<OUT>}]   ;# first: any path at all? (else answer 'no path')\nset_disable_timing [get_cells <GATE>]\nreport_checks -unconstrained -from [node {<IN>}] -to [node {<OUT>}]   ;# 'No paths found.' = every path goes through <GATE>",
+   "confidence": 93,
+   "verified": "16 cases on 4 testcases (7 yes / 9 no) exact. test32 prompt (n2->n12 via g0): no combinational path at all.",
+   "notes": ""
+  },
+  {
+   "type": "Analytical",
+   "category": "Path Existence",
+   "count": 31,
+   "commands": "[LOAD]\nset_disable_timing [get_cells -of_objects [node {<AVOID>}]]    ;# avoided net: block its driver   (avoided gate: [get_cells <GATE>])\nreport_checks -unconstrained -from [node {<IN>}] -to [node {<OUT>}]\n# a reported path = YES (the path is listed) ; 'No paths found.' = NO",
+   "confidence": 95,
+   "verified": "All 31 prompts exact (18 yes / 13 no) on 15 testcases.",
+   "notes": ""
+  },
+  {
+   "type": "Analytical",
+   "category": "Reachability",
+   "count": 1,
+   "commands": "[LOAD]\nputl [inst_names [get_fanout -from [node {<IN>}] -flat -only_cells] comb]",
+   "confidence": 93,
+   "verified": "test31 n2 (prompt) = 343 gates, exact.",
+   "notes": "Combinational reachability only (doesn't cross DFFs)."
+  },
+  {
+   "type": "Analytical",
+   "category": "Sequential Element Listing",
+   "count": 2,
+   "commands": "[LOAD]\nputl [inst_names [get_cells -of_objects [get_pins -of_objects [get_nets {<CLK>}] -filter \"direction==input && name==CLK\"]]]",
+   "confidence": 95,
+   "verified": "test35 (4,028), test21 (55), test40 (2,585) DFFs on n0: exact.",
+   "notes": ""
+  },
+  {
+   "type": "Modification",
+   "category": "Renaming",
+   "count": 7,
+   "commands": "[LOAD]\n[[ord::get_db_block] findInst <OLD_GATE>] rename <NEW_NAME>\n[[ord::get_db_block] findNet <OLD_NET>] rename <NEW_NAME>\n[WRITE]",
+   "confidence": 88,
+   "verified": "test24 g0 and test25 g0 + n74 (prompts): renamed instance/net appear everywhere in the written netlist; all other names and connections unchanged.",
+   "notes": "See Write Output for the constant-net caveat."
+  },
+  {
+   "type": "Setup",
+   "category": "Load Design",
+   "count": 39,
+   "commands": "[LOAD]\nreport_cell_usage",
+   "confidence": 95,
+   "verified": "All 40 netlists load with no warnings or errors; per-type and total cell counts equal the original netlists.",
+   "notes": ""
+  },
+  {
+   "type": "Setup",
+   "category": "Testcase Header",
+   "count": 39,
+   "commands": "N/A - bookkeeping only (log file name); no OpenROAD command.",
+   "confidence": "N/A",
+   "verified": "Not applicable.",
+   "notes": ""
+  },
+  {
+   "type": "Setup",
+   "category": "Write Output",
+   "count": 39,
+   "commands": "[LOAD]\n<edits, if any>\n[WRITE]",
+   "confidence": 75,
+   "verified": "Written netlists for test04/17/21/24/25/31 re-parsed: every instance, connection, DFF pin and port matches the input.",
+   "notes": "Constants are written as a net named one_/zero_ that is never declared or driven (e.g. .SN(one_)), so the constant value is lost in the file. Pin order and formatting differ from the input (named pins, one per line)."
+  }
+ ],
+ "prompts": [
+  {
+   "case": "test02",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test02.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test02",
+   "no": 2,
+   "prompt": "Please load the design from the file test02.v located in the directory testcase/test02/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test02",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test02",
+   "no": 4,
+   "prompt": "Please write the current design to the output file test02_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test03",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test03.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test03",
+   "no": 2,
+   "prompt": "Please load the design from the file test03.v located in the directory testcase/test03/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test03",
+   "no": 3,
+   "prompt": "How many gates are in the fanin cone of primary output n15?",
+   "type": "Analytical",
+   "category": "Fanin Cone Size"
+  },
+  {
+   "case": "test03",
+   "no": 4,
+   "prompt": "Please write the current design to the output file test03_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test04",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test04.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test04",
+   "no": 2,
+   "prompt": "Please load the design from the file test04.v located in the directory testcase/test04/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test04",
+   "no": 3,
+   "prompt": "Compute the maximum logic depth of the fanin cone of output n3.",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test04",
+   "no": 4,
+   "prompt": "Please write the current design to the output file test04_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test05",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test05.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test05",
+   "no": 2,
+   "prompt": "Please load the design from the file test05.v located in the directory testcase/test05/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test05",
+   "no": 3,
+   "prompt": "What is the fanout of primary input n5? List all gates that n5 drives directly.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test05",
+   "no": 4,
+   "prompt": "Please write the current design to the output file test05_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test06",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test06.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test06",
+   "no": 2,
+   "prompt": "Please load the design from the file test06.v located in the directory testcase/test06/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test06",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test06",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n0[0] to n4 exists that does not traverse node n719.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test06",
+   "no": 5,
+   "prompt": "Please write the current design to the output file test06_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test07",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test07.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test07",
+   "no": 2,
+   "prompt": "Please load the design from the file test07.v located in the directory testcase/test07/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test07",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test07",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n0[0] to n5 exists that does not traverse node n95.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test07",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n0[1] to output n6 exists while avoiding n94.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test07",
+   "no": 6,
+   "prompt": "Please write the current design to the output file test07_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test08",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test08.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test08",
+   "no": 2,
+   "prompt": "Please load the design from the file test08.v located in the directory testcase/test08/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test08",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test08",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n0[0] to n9 exists that does not traverse node n14.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test08",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n0[1] to output n10 exists while avoiding n14.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test08",
+   "no": 7,
+   "prompt": "Please write the current design to the output file test08_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test09",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test09.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test09",
+   "no": 2,
+   "prompt": "Please load the design from the file test09.v located in the directory testcase/test09/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test09",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test09",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n0 to n117[0] exists that does not traverse node n1816.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test09",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n1 to output n117[1] exists while avoiding n1646.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test09",
+   "no": 8,
+   "prompt": "Please write the current design to the output file test09_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test10",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test10.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test10",
+   "no": 2,
+   "prompt": "Please load the design from the file test10.v located in the directory testcase/test10/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test10",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test10",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n12 to n25[0] exists that does not traverse node n1127.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test10",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n13 to output n25[1] exists while avoiding n4156.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test10",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n12 to output n25[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test10",
+   "no": 9,
+   "prompt": "Please write the current design to the output file test10_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test11",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test11.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test11",
+   "no": 2,
+   "prompt": "Please load the design from the file test11.v located in the directory testcase/test11/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test11",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test11",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n29 to n31[0] exists that does not traverse node n1552.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test11",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n30 to output n31[1] exists while avoiding n1592.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test11",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n29 to output n31[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test11",
+   "no": 9,
+   "prompt": "Determine the longest combinational path depth from n30 to n31[1].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test11",
+   "no": 10,
+   "prompt": "Please write the current design to the output file test11_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test12",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test12.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test12",
+   "no": 2,
+   "prompt": "Please load the design from the file test12.v located in the directory testcase/test12/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test12",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test12",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n24[0] to n26[0] exists that does not traverse node n86984.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test12",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n24[1] to output n26[1] exists while avoiding n87234.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test12",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n24[0] to output n26[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test12",
+   "no": 9,
+   "prompt": "Determine the longest combinational path depth from n24[1] to n26[1].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test12",
+   "no": 10,
+   "prompt": "Determine the number of gates driven by g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test12",
+   "no": 11,
+   "prompt": "Please write the current design to the output file test12_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test13",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test13.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test13",
+   "no": 2,
+   "prompt": "Please load the design from the file test13.v located in the directory testcase/test13/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test13",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test13",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n2 to n5[0] exists that does not traverse node n58.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test13",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n3 to output n5[1] exists while avoiding n208.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test13",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n2 to output n5[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test13",
+   "no": 9,
+   "prompt": "Determine the longest combinational path depth from n3 to n5[1].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test13",
+   "no": 10,
+   "prompt": "Calculate the critical path depth between n4 and n5[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test13",
+   "no": 11,
+   "prompt": "Determine the number of gates driven by g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test13",
+   "no": 12,
+   "prompt": "Please write the current design to the output file test13_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test14",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test14.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test14",
+   "no": 2,
+   "prompt": "Please load the design from the file test14.v located in the directory testcase/test14/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test14",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test14",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n61 to n63[0] exists that does not traverse node n4363.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test14",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n0[0] to output n63[1] exists while avoiding n141.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test14",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n61 to output n63[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test14",
+   "no": 9,
+   "prompt": "Determine the longest combinational path depth from n0[0] to n63[1].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test14",
+   "no": 10,
+   "prompt": "Calculate the critical path depth between n0[1] and n63[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test14",
+   "no": 11,
+   "prompt": "Determine the number of gates driven by g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test14",
+   "no": 12,
+   "prompt": "Enumerate the immediate successors of gate g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test14",
+   "no": 13,
+   "prompt": "Please write the current design to the output file test14_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test15",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test15.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test15",
+   "no": 2,
+   "prompt": "Please load the design from the file test15.v located in the directory testcase/test15/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test15",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test15",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n0[0] to n3 exists that does not traverse node n207.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test15",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n0[1] to output n4 exists while avoiding n29.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test15",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n0[0] to output n3.",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test15",
+   "no": 9,
+   "prompt": "Determine the longest combinational path depth from n0[1] to n4.",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test15",
+   "no": 10,
+   "prompt": "Determine the number of gates driven by g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test15",
+   "no": 11,
+   "prompt": "Enumerate the immediate successors of gate g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test15",
+   "no": 12,
+   "prompt": "Compute the transitive fanin cone of output n3.",
+   "type": "Analytical",
+   "category": "Fanin Cone"
+  },
+  {
+   "case": "test15",
+   "no": 13,
+   "prompt": "Compute the transitive fanout cone of input n0[0].",
+   "type": "Analytical",
+   "category": "Fanout Cone"
+  },
+  {
+   "case": "test15",
+   "no": 14,
+   "prompt": "Please write the current design to the output file test15_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test16",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test16.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test16",
+   "no": 2,
+   "prompt": "Please load the design from the file test16.v located in the directory testcase/test16/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test16",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test16",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n6 to n33[0] exists that does not traverse node n16010.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test16",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n7 to output n33[1] exists while avoiding n15819.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test16",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n6 to output n33[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test16",
+   "no": 9,
+   "prompt": "Determine the longest combinational path depth from n7 to n33[1].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test16",
+   "no": 10,
+   "prompt": "Calculate the critical path depth between n8 and n33[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test16",
+   "no": 11,
+   "prompt": "Determine the number of gates driven by g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test16",
+   "no": 12,
+   "prompt": "Enumerate the immediate successors of gate g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test16",
+   "no": 13,
+   "prompt": "Compute the transitive fanin cone of output n33[0].",
+   "type": "Analytical",
+   "category": "Fanin Cone"
+  },
+  {
+   "case": "test16",
+   "no": 14,
+   "prompt": "Compute the transitive fanout cone of input n6.",
+   "type": "Analytical",
+   "category": "Fanout Cone"
+  },
+  {
+   "case": "test16",
+   "no": 15,
+   "prompt": "Please write the current design to the output file test16_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test17",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test17.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test17",
+   "no": 2,
+   "prompt": "Please load the design from the file test17.v located in the directory testcase/test17/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test17",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test17",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n7 to n42[0] exists that does not traverse node n1034.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test17",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n8 to output n42[1] exists while avoiding n2116.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test17",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n7 to output n42[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test17",
+   "no": 9,
+   "prompt": "Determine the longest combinational path depth from n8 to n42[1].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test17",
+   "no": 10,
+   "prompt": "Calculate the critical path depth between n9 and n42[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test17",
+   "no": 11,
+   "prompt": "Determine the number of gates driven by g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test17",
+   "no": 12,
+   "prompt": "Enumerate the immediate successors of gate g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test17",
+   "no": 13,
+   "prompt": "Compute the transitive fanin cone of output n42[0].",
+   "type": "Analytical",
+   "category": "Fanin Cone"
+  },
+  {
+   "case": "test17",
+   "no": 14,
+   "prompt": "Compute the transitive fanout cone of input n7.",
+   "type": "Analytical",
+   "category": "Fanout Cone"
+  },
+  {
+   "case": "test17",
+   "no": 16,
+   "prompt": "Please write the current design to the output file test17_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test18",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test18.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test18",
+   "no": 2,
+   "prompt": "Please load the design from the file test18.v located in the directory testcase/test18/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test18",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test18",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n0[0] to n12 exists that does not traverse node n1038.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test18",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n0[1] to output n13 exists while avoiding n1080.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test18",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n0[0] to output n12.",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test18",
+   "no": 9,
+   "prompt": "Determine the longest combinational path depth from n0[1] to n13.",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test18",
+   "no": 10,
+   "prompt": "Determine the number of gates driven by g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test18",
+   "no": 11,
+   "prompt": "Enumerate the immediate successors of gate g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test18",
+   "no": 12,
+   "prompt": "Compute the transitive fanin cone of output n12.",
+   "type": "Analytical",
+   "category": "Fanin Cone"
+  },
+  {
+   "case": "test18",
+   "no": 13,
+   "prompt": "Compute the transitive fanout cone of input n0[0].",
+   "type": "Analytical",
+   "category": "Fanout Cone"
+  },
+  {
+   "case": "test18",
+   "no": 17,
+   "prompt": "Please write the current design to the output file test18_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test19",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test19.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test19",
+   "no": 2,
+   "prompt": "Please load the design from the file test19.v located in the directory testcase/test19/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test19",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test19",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n3 to n17[0] exists that does not traverse node n269.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test19",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n4 to output n17[1] exists while avoiding n269.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test19",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n3 to output n17[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test19",
+   "no": 9,
+   "prompt": "Determine the longest combinational path depth from n4 to n17[1].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test19",
+   "no": 10,
+   "prompt": "Calculate the critical path depth between n5 and n17[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test19",
+   "no": 11,
+   "prompt": "Determine the number of gates driven by g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test19",
+   "no": 12,
+   "prompt": "Enumerate the immediate successors of gate g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test19",
+   "no": 13,
+   "prompt": "Compute the transitive fanin cone of output n17[0].",
+   "type": "Analytical",
+   "category": "Fanin Cone"
+  },
+  {
+   "case": "test19",
+   "no": 14,
+   "prompt": "Compute the transitive fanout cone of input n3.",
+   "type": "Analytical",
+   "category": "Fanout Cone"
+  },
+  {
+   "case": "test19",
+   "no": 18,
+   "prompt": "Please write the current design to the output file test19_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test20",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test20.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test20",
+   "no": 2,
+   "prompt": "Please load the design from the file test20.v located in the directory testcase/test20/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test20",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test20",
+   "no": 4,
+   "prompt": "Determine whether a combinational path from n13 to n25[0] exists that does not traverse node n2240.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test20",
+   "no": 5,
+   "prompt": "Verify whether a path connecting input n14 to output n25[1] exists while avoiding n13083.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test20",
+   "no": 8,
+   "prompt": "Compute the maximum logic depth from input n13 to output n25[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test20",
+   "no": 9,
+   "prompt": "Determine the longest combinational path depth from n14 to n25[1].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test20",
+   "no": 10,
+   "prompt": "Calculate the critical path depth between n15 and n25[0].",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test20",
+   "no": 11,
+   "prompt": "Determine the number of gates driven by g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test20",
+   "no": 12,
+   "prompt": "Enumerate the immediate successors of gate g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test20",
+   "no": 13,
+   "prompt": "Compute the transitive fanin cone of output n25[0].",
+   "type": "Analytical",
+   "category": "Fanin Cone"
+  },
+  {
+   "case": "test20",
+   "no": 14,
+   "prompt": "Compute the transitive fanout cone of input n13.",
+   "type": "Analytical",
+   "category": "Fanout Cone"
+  },
+  {
+   "case": "test20",
+   "no": 18,
+   "prompt": "Compute the total gate count of the design.",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test20",
+   "no": 19,
+   "prompt": "Please write the current design to the output file test20_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test21",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test21.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test21",
+   "no": 2,
+   "prompt": "Please load the design from the file test21.v located in the directory testcase/test21/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test21",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test21",
+   "no": 5,
+   "prompt": "Please write the current design to the output file test21_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test22",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test22.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test22",
+   "no": 2,
+   "prompt": "Please load the design from the file test22.v located in the directory testcase/test22/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test22",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test22",
+   "no": 5,
+   "prompt": "Please write the current design to the output file test22_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test23",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test23.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test23",
+   "no": 2,
+   "prompt": "Please load the design from the file test23.v located in the directory testcase/test23/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test23",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test23",
+   "no": 6,
+   "prompt": "Please write the current design to the output file test23_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test24",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test24.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test24",
+   "no": 2,
+   "prompt": "Please load the design from the file test24.v located in the directory testcase/test24/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test24",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test24",
+   "no": 5,
+   "prompt": "Rename gate g0 to renamed_gate. Ensure functional equivalence is preserved.",
+   "type": "Optimization",
+   "category": "Renaming"
+  },
+  {
+   "case": "test24",
+   "no": 7,
+   "prompt": "Please write the current design to the output file test24_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test25",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test25.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test25",
+   "no": 2,
+   "prompt": "Please load the design from the file test25.v located in the directory testcase/test25/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test25",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test25",
+   "no": 6,
+   "prompt": "Change the identifier of gate g0 to renamed_gate and update all references. Ensure the design functionality does not change.",
+   "type": "Optimization",
+   "category": "Renaming"
+  },
+  {
+   "case": "test25",
+   "no": 7,
+   "prompt": "Change the identifier of wire n74 to renamed_wire and update all references. Ensure the design functionality does not change.",
+   "type": "Optimization",
+   "category": "Renaming"
+  },
+  {
+   "case": "test25",
+   "no": 9,
+   "prompt": "Please write the current design to the output file test25_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test26",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test26.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test26",
+   "no": 2,
+   "prompt": "Please load the design from the file test26.v located in the directory testcase/test26/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test26",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test26",
+   "no": 8,
+   "prompt": "Please write the current design to the output file test26_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test27",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test27.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test27",
+   "no": 2,
+   "prompt": "Please load the design from the file test27.v located in the directory testcase/test27/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test27",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test27",
+   "no": 8,
+   "prompt": "Please write the current design to the output file test27_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test28",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test28.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test28",
+   "no": 2,
+   "prompt": "Please load the design from the file test28.v located in the directory testcase/test28/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test28",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test28",
+   "no": 8,
+   "prompt": "Please write the current design to the output file test28_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test29",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test29.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test29",
+   "no": 2,
+   "prompt": "Please load the design from the file test29.v located in the directory testcase/test29/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test29",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test29",
+   "no": 9,
+   "prompt": "Please write the current design to the output file test29_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test30",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test30.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test30",
+   "no": 2,
+   "prompt": "Please load the design from the file test30.v located in the directory testcase/test30/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test30",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test30",
+   "no": 9,
+   "prompt": "Please write the current design to the output file test30_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test31",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test31.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test31",
+   "no": 2,
+   "prompt": "Please load the design from the file test31.v located in the directory testcase/test31/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test31",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test31",
+   "no": 4,
+   "prompt": "Determine all gates reachable from n2.",
+   "type": "Analytical",
+   "category": "Reachability"
+  },
+  {
+   "case": "test31",
+   "no": 7,
+   "prompt": "What is the fanout of primary input n0? List every gate that n0 drives directly.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test31",
+   "no": 9,
+   "prompt": "Report all gates shared between the fanin cones of n16 and n17.",
+   "type": "Analytical",
+   "category": "Fanin Cone Intersection"
+  },
+  {
+   "case": "test31",
+   "no": 11,
+   "prompt": "Report every gate connected to the output of g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test31",
+   "no": 12,
+   "prompt": "Try to rename internal signal n1289 to renamed_sig and update all references to it. Ensure the design functionality does not change.",
+   "type": "Optimization",
+   "category": "Renaming"
+  },
+  {
+   "case": "test31",
+   "no": 13,
+   "prompt": "List all gates that now connect to the renamed signal renamed_sig.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test31",
+   "no": 16,
+   "prompt": "What is the maximum logic depth from any primary input to any DFF D-pin in this design?",
+   "type": "Analytical",
+   "category": "Logic Depth (Sequential)"
+  },
+  {
+   "case": "test31",
+   "no": 17,
+   "prompt": "How many outputs have a logic depth greater than 4?",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test31",
+   "no": 18,
+   "prompt": "What type of gate is g0? Report its gate type and pin connections.",
+   "type": "Analytical",
+   "category": "Gate Inspection"
+  },
+  {
+   "case": "test31",
+   "no": 20,
+   "prompt": "Please write the current design to the output file test31_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test32",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test32.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test32",
+   "no": 2,
+   "prompt": "Please load the design from the file test32.v located in the directory testcase/test32/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test32",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test32",
+   "no": 4,
+   "prompt": "Determine whether gate g0 lies on any maximum-depth path of the design. Report yes or no.",
+   "type": "Analytical",
+   "category": "Critical Path Membership"
+  },
+  {
+   "case": "test32",
+   "no": 5,
+   "prompt": "Determine the number of primary inputs and outputs.",
+   "type": "Analytical",
+   "category": "I/O Summary"
+  },
+  {
+   "case": "test32",
+   "no": 8,
+   "prompt": "How many NOT gates are currently in the design?",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test32",
+   "no": 9,
+   "prompt": "Does every path from input n2 to output n12 pass through gate g0? Report yes or no.",
+   "type": "Analytical",
+   "category": "Path Dominance"
+  },
+  {
+   "case": "test32",
+   "no": 10,
+   "prompt": "Rename wire n1214 to renamed_wire. Ensure functional equivalence is preserved.",
+   "type": "Optimization",
+   "category": "Renaming"
+  },
+  {
+   "case": "test32",
+   "no": 12,
+   "prompt": "What is the transitive fanout of primary input n0? List all gates reachable from n0.",
+   "type": "Analytical",
+   "category": "Fanout Cone"
+  },
+  {
+   "case": "test32",
+   "no": 13,
+   "prompt": "How many gates are in the logic cone of output n12?",
+   "type": "Analytical",
+   "category": "Logic Cone Size"
+  },
+  {
+   "case": "test32",
+   "no": 16,
+   "prompt": "Report any NAND gates with constant inputs (0 or 1) in this design.",
+   "type": "Analytical",
+   "category": "Constant Input Detection"
+  },
+  {
+   "case": "test32",
+   "no": 20,
+   "prompt": "Please write the current design to the output file test32_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test33",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test33.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test33",
+   "no": 2,
+   "prompt": "Please load the design from the file test33.v located in the directory testcase/test33/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test33",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test33",
+   "no": 15,
+   "prompt": "Determine whether wire n55104 is a cut between any primary input and any primary output. Report yes or no.",
+   "type": "Analytical",
+   "category": "Cut Analysis"
+  },
+  {
+   "case": "test33",
+   "no": 16,
+   "prompt": "Please list all the primary inputs of this design with their bit widths.",
+   "type": "Analytical",
+   "category": "I/O Summary"
+  },
+  {
+   "case": "test33",
+   "no": 20,
+   "prompt": "Please write the current design to the output file test33_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test34",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test34.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test34",
+   "no": 2,
+   "prompt": "Please load the design from the file test34.v located in the directory testcase/test34/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test34",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test34",
+   "no": 8,
+   "prompt": "Does a combinational path from n2 to n30 exist that avoids n4552?",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test34",
+   "no": 9,
+   "prompt": "What is the maximum combinational depth from any primary input to any primary output in the entire design?",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test34",
+   "no": 10,
+   "prompt": "Which output bit has the deepest fanin logic cone?",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test34",
+   "no": 11,
+   "prompt": "What is the fanout of primary input n0? List every gate that n0 drives directly.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test34",
+   "no": 12,
+   "prompt": "Please write the current design to the output file test34_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test35",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test35.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test35",
+   "no": 2,
+   "prompt": "Please load the design from the file test35.v located in the directory testcase/test35/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test35",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test35",
+   "no": 6,
+   "prompt": "Does a combinational path exist from primary input n2 to primary output n25? Report yes or no.",
+   "type": "Analytical",
+   "category": "Path Existence"
+  },
+  {
+   "case": "test35",
+   "no": 7,
+   "prompt": "Report every gate connected to the output of g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test35",
+   "no": 8,
+   "prompt": "Which output bit has the deepest fanin logic cone?",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test35",
+   "no": 9,
+   "prompt": "List all NAND gates in this design with their input and output signals.",
+   "type": "Analytical",
+   "category": "Gate Listing"
+  },
+  {
+   "case": "test35",
+   "no": 10,
+   "prompt": "Update the name of signal n7431 to renamed_wire throughout the netlist. Ensure the design functionality does not change.",
+   "type": "Optimization",
+   "category": "Renaming"
+  },
+  {
+   "case": "test35",
+   "no": 15,
+   "prompt": "What is the maximum combinational logic depth in the design now?",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test35",
+   "no": 17,
+   "prompt": "List all flip-flops driven by clock n0.",
+   "type": "Analytical",
+   "category": "Sequential Element Listing"
+  },
+  {
+   "case": "test35",
+   "no": 20,
+   "prompt": "Please write the current design to the output file test35_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test36",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test36.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test36",
+   "no": 2,
+   "prompt": "Please load the design from the file test36.v located in the directory testcase/test36/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test36",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test36",
+   "no": 4,
+   "prompt": "Determine whether wire n10239 is a cut between any primary input and any primary output. Report yes or no.",
+   "type": "Analytical",
+   "category": "Cut Analysis"
+  },
+  {
+   "case": "test36",
+   "no": 6,
+   "prompt": "Report any AND gates with a constant 0 input in this design.",
+   "type": "Analytical",
+   "category": "Constant Input Detection"
+  },
+  {
+   "case": "test36",
+   "no": 9,
+   "prompt": "What type of gate is g0? Report its gate type and pin connections.",
+   "type": "Analytical",
+   "category": "Gate Inspection"
+  },
+  {
+   "case": "test36",
+   "no": 10,
+   "prompt": "What is the maximum logic depth from any primary input to any DFF D-pin in this design?",
+   "type": "Analytical",
+   "category": "Logic Depth (Sequential)"
+  },
+  {
+   "case": "test36",
+   "no": 12,
+   "prompt": "List all flip-flops driven by clock n0.",
+   "type": "Analytical",
+   "category": "Sequential Element Listing"
+  },
+  {
+   "case": "test36",
+   "no": 13,
+   "prompt": "Which primary input has the highest fanout in this design?",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test36",
+   "no": 15,
+   "prompt": "What is the maximum fanout of n1 now?",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test36",
+   "no": 16,
+   "prompt": "What is the fanout of primary input n0? List every gate that n0 drives directly.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test36",
+   "no": 17,
+   "prompt": "Please write the current design to the output file test36_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test37",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test37.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test37",
+   "no": 2,
+   "prompt": "Please load the design from the file test37.v located in the directory testcase/test37/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test37",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test37",
+   "no": 4,
+   "prompt": "Report the number of each gate type in the cone of n8.",
+   "type": "Analytical",
+   "category": "Gate Count (Cone)"
+  },
+  {
+   "case": "test37",
+   "no": 10,
+   "prompt": "How many primary inputs and primary outputs does this design have?",
+   "type": "Analytical",
+   "category": "I/O Summary"
+  },
+  {
+   "case": "test37",
+   "no": 11,
+   "prompt": "List all primary outputs of this design with their bit widths.",
+   "type": "Analytical",
+   "category": "I/O Summary"
+  },
+  {
+   "case": "test37",
+   "no": 12,
+   "prompt": "List all gates with one or more inputs tied to 1'b1.",
+   "type": "Analytical",
+   "category": "Constant Input Detection"
+  },
+  {
+   "case": "test37",
+   "no": 14,
+   "prompt": "Check if there are any floating inputs or unconnected output ports in this design.",
+   "type": "Analytical",
+   "category": "Floating Signal Detection"
+  },
+  {
+   "case": "test37",
+   "no": 16,
+   "prompt": "Report every gate connected to the output of g0.",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test37",
+   "no": 18,
+   "prompt": "Please write the current design to the output file test37_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test38",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test38.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test38",
+   "no": 2,
+   "prompt": "Please load the design from the file test38.v located in the directory testcase/test38/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test38",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test38",
+   "no": 5,
+   "prompt": "What is the maximum fanout of n1 now?",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test38",
+   "no": 6,
+   "prompt": "Which primary input has the highest fanout in this design?",
+   "type": "Analytical",
+   "category": "Fanout Analysis"
+  },
+  {
+   "case": "test38",
+   "no": 8,
+   "prompt": "What is the maximum combinational logic depth in the design now?",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test38",
+   "no": 12,
+   "prompt": "Find all articulation points in the combinational graph between n2 and n14.",
+   "type": "Analytical",
+   "category": "Cut Analysis"
+  },
+  {
+   "case": "test38",
+   "no": 13,
+   "prompt": "Update the name of signal n440 to renamed_wire throughout the netlist. Ensure the design functionality does not change.",
+   "type": "Optimization",
+   "category": "Renaming"
+  },
+  {
+   "case": "test38",
+   "no": 15,
+   "prompt": "Report any NAND gates with constant inputs (0 or 1) in this design.",
+   "type": "Analytical",
+   "category": "Constant Input Detection"
+  },
+  {
+   "case": "test38",
+   "no": 18,
+   "prompt": "Report the number of each gate type in the cone of n14.",
+   "type": "Analytical",
+   "category": "Gate Count (Cone)"
+  },
+  {
+   "case": "test38",
+   "no": 19,
+   "prompt": "Compute the fanin logic cone of output n14 and list all gates that contribute to this output.",
+   "type": "Analytical",
+   "category": "Fanin Cone"
+  },
+  {
+   "case": "test38",
+   "no": 20,
+   "prompt": "Please write the current design to the output file test38_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test39",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test39.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test39",
+   "no": 2,
+   "prompt": "Please load the design from the file test39.v located in the directory testcase/test39/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test39",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test39",
+   "no": 4,
+   "prompt": "Report any OR gates with a constant 1 input in this design.",
+   "type": "Analytical",
+   "category": "Constant Input Detection"
+  },
+  {
+   "case": "test39",
+   "no": 7,
+   "prompt": "How many outputs have a logic depth greater than 4?",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test39",
+   "no": 9,
+   "prompt": "What is the maximum combinational logic depth in the design now?",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test39",
+   "no": 10,
+   "prompt": "List all XOR gates in this design.",
+   "type": "Analytical",
+   "category": "Gate Listing"
+  },
+  {
+   "case": "test39",
+   "no": 14,
+   "prompt": "Report any NOR gates with constant inputs in this design.",
+   "type": "Analytical",
+   "category": "Constant Input Detection"
+  },
+  {
+   "case": "test39",
+   "no": 17,
+   "prompt": "Please list all the primary inputs of this design with their bit widths.",
+   "type": "Analytical",
+   "category": "I/O Summary"
+  },
+  {
+   "case": "test39",
+   "no": 20,
+   "prompt": "Please write the current design to the output file test39_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  },
+  {
+   "case": "test40",
+   "no": 1,
+   "prompt": "This is the beginning of a new testcase. The case name is test40.",
+   "type": "Setup",
+   "category": "Testcase Header"
+  },
+  {
+   "case": "test40",
+   "no": 2,
+   "prompt": "Please load the design from the file test40.v located in the directory testcase/test40/.",
+   "type": "Setup",
+   "category": "Load Design"
+  },
+  {
+   "case": "test40",
+   "no": 3,
+   "prompt": "Please count all the gates in this design and report the total count broken down by gate type (AND, OR, NOT, NAND, NOR, XOR, XNOR, BUF, DFF).",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test40",
+   "no": 6,
+   "prompt": "How many NOT gates are currently in the design?",
+   "type": "Analytical",
+   "category": "Gate Count"
+  },
+  {
+   "case": "test40",
+   "no": 9,
+   "prompt": "List all primary outputs of this design with their bit widths.",
+   "type": "Analytical",
+   "category": "I/O Summary"
+  },
+  {
+   "case": "test40",
+   "no": 10,
+   "prompt": "List all XOR gates in this design.",
+   "type": "Analytical",
+   "category": "Gate Listing"
+  },
+  {
+   "case": "test40",
+   "no": 11,
+   "prompt": "What is the maximum combinational depth on any register-to-register path in this design?",
+   "type": "Analytical",
+   "category": "Logic Depth (Sequential)"
+  },
+  {
+   "case": "test40",
+   "no": 14,
+   "prompt": "What type of gate is g0? Report its gate type and pin connections.",
+   "type": "Analytical",
+   "category": "Gate Inspection"
+  },
+  {
+   "case": "test40",
+   "no": 15,
+   "prompt": "Which output has the largest fanin cone?",
+   "type": "Analytical",
+   "category": "Fanin Cone"
+  },
+  {
+   "case": "test40",
+   "no": 17,
+   "prompt": "What is the depth of the cone of n14 now?",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test40",
+   "no": 18,
+   "prompt": "What is the maximum combinational logic depth in the design now?",
+   "type": "Analytical",
+   "category": "Logic Depth"
+  },
+  {
+   "case": "test40",
+   "no": 19,
+   "prompt": "Please write the current design to the output file test40_out.v.",
+   "type": "Setup",
+   "category": "Write Output"
+  }
+ ]
+}

@@ -1,27 +1,15 @@
 """MCP server exposing OpenROAD static timing analysis (OpenSTA) tools.
 
 The server runs on Windows and drives one persistent ``openroad`` process inside
-WSL. A small Tcl driver script (``DRIVER_TCL``) is the openroad command file: it
-reads one request per stdin line (``<tag> <base64 Tcl script>``), evaluates it
-at global scope and prints sentinel lines so the Python side knows where each
-command's output ends and whether it failed. The design is loaded once and every
-later tool call is a fast query against the live timing graph.
+WSL (see ``openroad_common.session``). The design is loaded once and every later
+tool call is a fast query against the live timing graph.
 """
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import math
-import os
 import re
-import shlex
 import subprocess
-import sys
-import tempfile
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -29,58 +17,22 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+from openroad_common import (
+    Config,
+    OpenRoadError,
+    OpenRoadSession,
+    tcl_file,
+    tcl_list,
+    tcl_quote,
+)
+from openroad_common.parsing import parse_slack_report
 
+CFG = Config.from_env("STA")
 
-@dataclass(frozen=True)
-class Config:
-    wsl_distro: str
-    binary: str
-    args: list[str]
-    threads: str
-    wsl_setup: str
-    timeout: float
-    startup_timeout: float
-    max_output: int
-    allow_raw_tcl: bool
+StaError = OpenRoadError
 
-    @classmethod
-    def from_env(cls) -> Config:
-        return cls(
-            wsl_distro=os.environ.get("STA_WSL_DISTRO", "Ubuntu"),
-            binary=os.environ.get("STA_BINARY", "openroad"),
-            args=shlex.split(os.environ.get("STA_ARGS", "-no_init -no_splash")),
-            threads=os.environ.get("STA_THREADS", "max"),
-            wsl_setup=os.environ.get("STA_WSL_SETUP", ""),
-            timeout=float(os.environ.get("STA_TIMEOUT", "600")),
-            startup_timeout=float(os.environ.get("STA_STARTUP_TIMEOUT", "120")),
-            max_output=int(os.environ.get("STA_MAX_OUTPUT", "60000")),
-            allow_raw_tcl=os.environ.get("STA_ALLOW_RAW_TCL", "1") not in ("0", "false", "no", ""),
-        )
-
-
-CFG = Config.from_env()
-
-READY_SENTINEL = "__MCP_READY__"
-
-# Tcl driver run as the openroad command file. Helper procs defined here are
-# available to every script the tools send.
-DRIVER_TCL = r"""
-# mcp_sta driver: one request per stdin line, "<tag> <base64 utf-8 Tcl script>".
-fconfigure stdin -translation lf
-fconfigure stdout -translation lf -encoding utf-8
-
-# Normalize a path and fail with a clear message if it does not exist in WSL.
-proc __mcp_file {path} {
-  set p [file normalize $path]
-  if {![file exists $p]} {
-    error "File not found inside WSL: $path"
-  }
-  return $p
-}
-
+# STA-only helper procs added to the shared Tcl driver.
+STA_DRIVER_TCL = r"""
 # Resolve a name/pattern to pins, then ports, then instances, then clocks.
 proc __mcp_objs {pattern} {
   foreach cmd {get_pins get_ports get_cells get_clocks} {
@@ -99,27 +51,9 @@ proc __mcp_names {objs} {
   }
   return $names
 }
-
-puts "__MCP_READY__"
-flush stdout
-while {[gets stdin line] >= 0} {
-  set line [string trim $line]
-  if {$line eq ""} {
-    continue
-  }
-  lassign [split $line " "] __mcp_tag __mcp_payload
-  set __mcp_script [encoding convertfrom utf-8 [binary decode base64 $__mcp_payload]]
-  set __mcp_rc [catch {uplevel #0 $__mcp_script} __mcp_err]
-  flush stdout
-  if {$__mcp_rc == 1} {
-    puts "\n__MCP_${__mcp_tag}_ERR__"
-    puts $__mcp_err
-  }
-  puts "\n__MCP_${__mcp_tag}_END__"
-  flush stdout
-}
-exit
 """
+
+SESSION = OpenRoadSession(CFG, "sta", STA_DRIVER_TCL)
 
 
 # ---------------------------------------------------------------------------
@@ -127,101 +61,9 @@ exit
 # ---------------------------------------------------------------------------
 
 
-class StaError(ToolError):
-    """An OpenROAD/STA failure whose message is shown to the MCP client."""
-
-
-_DRIVE_RE = re.compile(r"^([A-Za-z]):[\\/]*(.*)$", re.DOTALL)
-_WSL_UNC_RE = re.compile(r"^[\\/]{2}wsl(?:\$|\.localhost)[\\/][^\\/]+[\\/]?(.*)$", re.IGNORECASE)
-
-
-def to_wsl_path(path: str) -> str:
-    r"""Convert a Windows path to the path openroad sees inside WSL.
-
-    ``C:\a\b.lib`` -> ``/mnt/c/a/b.lib``; ``\\wsl$\Ubuntu\home\x`` -> ``/home/x``.
-    POSIX paths (``/...`` or ``~/...``) are passed through unchanged, and relative
-    Windows paths are resolved against the server's working directory.
-    """
-    p = path.strip().strip('"').strip("'")
-    if not p:
-        raise ToolError("Empty file path.")
-    m = _WSL_UNC_RE.match(p)
-    if m:
-        return "/" + m.group(1).replace("\\", "/")
-    if p.startswith("/") or p.startswith("~"):
-        return p
-    if not _DRIVE_RE.match(p):
-        p = os.path.abspath(p)
-    m = _DRIVE_RE.match(p)
-    if not m:
-        raise ToolError(f"Cannot map path to WSL (use an absolute path): {path}")
-    return f"/mnt/{m.group(1).lower()}/" + m.group(2).replace("\\", "/")
-
-
-def tcl_quote(value: Any) -> str:
-    """Quote any value as a single Tcl word with no substitution."""
-    text = str(value)
-    for char, escaped in (
-        ("\\", "\\\\"),
-        ('"', '\\"'),
-        ("$", "\\$"),
-        ("[", "\\["),
-        ("]", "\\]"),
-        ("\n", "\\n"),
-        ("\r", "\\r"),
-    ):
-        text = text.replace(char, escaped)
-    return f'"{text}"'
-
-
-def tcl_list(items: list[Any]) -> str:
-    """Build a Tcl ``[list ...]`` expression from Python values."""
-    return "[list " + " ".join(tcl_quote(item) for item in items) + "]"
-
-
-def tcl_file(path: str) -> str:
-    """Tcl expression for a checked, normalized WSL path."""
-    return f"[__mcp_file {tcl_quote(to_wsl_path(path))}]"
-
-
 def tcl_objs(patterns: list[str]) -> str:
     """Tcl expression resolving names/patterns to pins, ports, instances or clocks."""
     return "[concat " + " ".join(f"[__mcp_objs {tcl_quote(p)}]" for p in patterns) + "]"
-
-
-def truncate(text: str, limit: int | None = None) -> str:
-    """Keep the head and tail of very long reports within ``limit`` characters."""
-    limit = limit or CFG.max_output
-    if len(text) <= limit:
-        return text
-    head = int(limit * 0.7)
-    tail = limit - head
-    dropped = len(text) - limit
-    return (
-        text[:head]
-        + f"\n\n... [{dropped} characters truncated; narrow the query or lower the path counts] ...\n\n"
-        + text[-tail:]
-    )
-
-
-_SLACK_RE = re.compile(r"^(worst slack|tns|wns)\s+(max|min)\s+(\S+)", re.MULTILINE)
-
-
-def _number(text: str) -> float | str:
-    try:
-        value = float(text)
-    except ValueError:
-        return text
-    return value if math.isfinite(value) else text
-
-
-def parse_slack_report(text: str) -> dict[str, dict[str, float | str]]:
-    """Parse ``worst slack max X`` / ``tns max X`` / ``wns max X`` lines."""
-    result: dict[str, dict[str, float | str]] = {"setup": {}, "hold": {}}
-    for kind, min_max, value in _SLACK_RE.findall(text):
-        check = "setup" if min_max == "max" else "hold"
-        result[check][kind.replace(" ", "_")] = _number(value)
-    return result
 
 
 def _status(slacks: dict[str, float | str]) -> str:
@@ -231,205 +73,8 @@ def _status(slacks: dict[str, float | str]) -> str:
     return "UNCONSTRAINED"
 
 
-def _lines(*parts: str) -> str:
-    return "\n".join(part for part in parts if part)
-
-
-# ---------------------------------------------------------------------------
-# Persistent OpenROAD session
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class DesignState:
-    loaded: bool = False
-    files: dict[str, list[str]] = field(default_factory=dict)
-    top_module: str | None = None
-    parasitics: str | None = None
-
-    def add(self, kind: str, *paths: str) -> None:
-        self.files.setdefault(kind, []).extend(paths)
-
-
-def write_driver() -> Path:
-    driver_dir = Path(tempfile.gettempdir()) / "mcp_sta"
-    driver_dir.mkdir(parents=True, exist_ok=True)
-    driver = driver_dir / "driver.tcl"
-    driver.write_text(DRIVER_TCL, encoding="utf-8", newline="\n")
-    return driver
-
-
-def build_command(driver_wsl_path: str) -> list[str]:
-    """wsl.exe command line that starts openroad on the driver script."""
-    parts = [CFG.binary, *CFG.args]
-    if CFG.threads:
-        parts += ["-threads", CFG.threads]
-    parts.append(driver_wsl_path)
-    inner = "exec " + " ".join(shlex.quote(p) for p in parts)
-    if CFG.wsl_setup:
-        inner = f"{CFG.wsl_setup} && {inner}"
-    return ["wsl.exe", "-d", CFG.wsl_distro, "--exec", "bash", "-lc", inner]
-
-
-class StaSession:
-    """One long-lived openroad process, serialized with an asyncio lock."""
-
-    def __init__(self) -> None:
-        self._proc: asyncio.subprocess.Process | None = None
-        self._lock = asyncio.Lock()
-        self._counter = 0
-        self.command: list[str] = []
-        self.startup_log = ""
-        self.design = DesignState()
-
-    @property
-    def running(self) -> bool:
-        return self._proc is not None and self._proc.returncode is None
-
-    @property
-    def pid(self) -> int | None:
-        return self._proc.pid if self.running else None
-
-    async def _readline(self) -> str | None:
-        assert self._proc is not None and self._proc.stdout is not None
-        raw = await self._proc.stdout.readline()
-        if not raw:
-            return None
-        return raw.decode("utf-8", errors="replace").replace("\x00", "").rstrip("\r\n")
-
-    async def _start_locked(self) -> None:
-        self.command = build_command(to_wsl_path(str(write_driver())))
-        kwargs: dict[str, Any] = {}
-        if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        try:
-            self._proc = await asyncio.create_subprocess_exec(
-                *self.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                limit=32 * 1024 * 1024,
-                env={**os.environ, "WSL_UTF8": "1"},
-                **kwargs,
-            )
-        except FileNotFoundError as exc:
-            raise StaError("wsl.exe not found. Install WSL, or run the server where WSL is available.") from exc
-
-        banner: list[str] = []
-        try:
-            async with asyncio.timeout(CFG.startup_timeout):
-                while True:
-                    line = await self._readline()
-                    if line is None:
-                        code = await self._proc.wait()
-                        self._proc = None
-                        raise StaError(
-                            f"OpenROAD failed to start (exit code {code}).\n"
-                            f"Command: {subprocess.list2cmdline(self.command)}\n"
-                            f"Output:\n{truncate(chr(10).join(banner), 4000)}\n\n"
-                            f"Check that '{CFG.binary}' is installed in WSL distro '{CFG.wsl_distro}' "
-                            "(STA_WSL_DISTRO), or set STA_WSL_SETUP to a command that puts it on PATH, "
-                            "e.g. 'source ~/OpenROAD-flow-scripts/env.sh'."
-                        )
-                    if line == READY_SENTINEL:
-                        break
-                    banner.append(line)
-        except TimeoutError:
-            await self._kill_locked()
-            raise StaError(
-                f"OpenROAD did not become ready within {CFG.startup_timeout:.0f}s.\n"
-                f"Output so far:\n{truncate(chr(10).join(banner), 4000)}"
-            ) from None
-        self.startup_log = "\n".join(banner).strip()
-
-    async def _kill_locked(self) -> None:
-        proc, self._proc = self._proc, None
-        self.design = DesignState()
-        if proc is None or proc.returncode is not None:
-            return
-        proc.kill()
-        try:
-            await asyncio.wait_for(proc.wait(), 10)
-        except TimeoutError:
-            pass
-
-    async def run(self, script: str, timeout: float | None = None) -> str:
-        """Run a Tcl script in the session and return its output.
-
-        Raises StaError (with the command output) if the script raises a Tcl error,
-        times out, or the process dies. Timeouts and crashes reset the session.
-        """
-        timeout = timeout or CFG.timeout
-        async with self._lock:
-            if not self.running:
-                await self._start_locked()
-            assert self._proc is not None and self._proc.stdin is not None
-            self._counter += 1
-            tag = f"{self._counter:06d}"
-            end_line, err_line = f"__MCP_{tag}_END__", f"__MCP_{tag}_ERR__"
-            payload = base64.b64encode(script.encode("utf-8")).decode("ascii")
-            output: list[str] = []
-            error: list[str] = []
-            in_error = False
-            try:
-                async with asyncio.timeout(timeout):
-                    self._proc.stdin.write(f"{tag} {payload}\n".encode("ascii"))
-                    await self._proc.stdin.drain()
-                    while True:
-                        line = await self._readline()
-                        if line is None:
-                            await self._kill_locked()
-                            raise StaError(
-                                "The OpenROAD process exited unexpectedly; the session was reset "
-                                "and the design must be loaded again.\nLast output:\n"
-                                + truncate("\n".join(output), 4000)
-                            )
-                        if line == end_line:
-                            break
-                        if line == err_line:
-                            in_error = True
-                            continue
-                        (error if in_error else output).append(line)
-            except TimeoutError:
-                await self._kill_locked()
-                raise StaError(
-                    f"Command timed out after {timeout:.0f}s. The OpenROAD session was restarted, "
-                    "so the design must be loaded again (raise STA_TIMEOUT for large designs).\n"
-                    "Partial output:\n" + truncate("\n".join(output), 4000)
-                ) from None
-            except (BrokenPipeError, ConnectionResetError):
-                await self._kill_locked()
-                raise StaError("Lost the connection to the OpenROAD process; the session was reset.") from None
-
-        text = "\n".join(output).strip()
-        if in_error:
-            message = "\n".join(error).strip()
-            raise StaError(truncate(_lines(message, f"--- output ---\n{text}" if text else "")))
-        return truncate(text)
-
-    async def restart(self) -> None:
-        async with self._lock:
-            await self._kill_locked()
-            await self._start_locked()
-
-    async def close(self) -> None:
-        async with self._lock:
-            proc = self._proc
-            if proc is not None and proc.returncode is None and proc.stdin is not None:
-                proc.stdin.close()
-                try:
-                    await asyncio.wait_for(proc.wait(), 5)
-                except TimeoutError:
-                    pass
-            await self._kill_locked()
-
-
-SESSION = StaSession()
-
-
 def require_design() -> None:
-    if not SESSION.running or not SESSION.design.loaded:
-        raise ToolError("No design is loaded. Call load_design first.")
+    SESSION.require_design()
 
 
 DESIGN_STATS_TCL = """

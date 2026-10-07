@@ -1,7 +1,7 @@
 [project]
 name = "mcp-sta"
 version = "0.1.0"
-description = "MCP server exposing OpenROAD static timing analysis (OpenSTA) tools"
+description = "MCP servers for OpenROAD: static timing analysis (mcp-sta), the OpenDB design database (mcp-odb), gate-level netlist analysis (mcp-netlist) and the physical-design stages (mcp-opt, mcp-place, ...)"
 readme = "README.md"
 authors = [
     { name = "anshwppr", email = "anshbajaj77@gmail.com" }
@@ -13,7 +13,26 @@ dependencies = [
 
 [project.scripts]
 mcp-sta = "mcp_sta:main"
+mcp-odb = "mcp_odb:main"
+mcp-netlist = "mcp_netlist:main"
+mcp-opt = "mcp_opt:main"
+mcp-place = "mcp_place:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["mcp_sta", "mcp_odb", "mcp_netlist", "mcp_opt", "mcp_place", "openroad_common"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "openroad: needs OpenROAD reachable through WSL",
+    "slow: large netlists (NETLIST_TASKS_TIER=full)",
+]

@@ -1,0 +1,12 @@
+{
+  "name": "nangate45",
+  "description": "FreePDK45 / Nangate45 Open Cell Library, from OpenROAD's test platform (Nangate45/Nangate45.vars). The test default; any other platform works the same way.",
+  "default": true,
+  "vars": "Nangate45/Nangate45.vars",
+  "overrides": {
+    "power_net": "VDD",
+    "ground_net": "VSS",
+    "diode_cell": null,
+    "diode_note": "ANTENNA_X1 has ANTENNADIFFAREA 0 in this LEF, so repair_antennas cannot insert diodes on this platform."
+  }
+}
